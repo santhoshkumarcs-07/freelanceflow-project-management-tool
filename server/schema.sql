@@ -10,16 +10,8 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_status TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_event_created BIGINT NOT NULL DEFAULT 0;
-CREATE UNIQUE INDEX IF NOT EXISTS users_stripe_customer_idx ON users(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS stripe_webhook_events (
-  id TEXT PRIMARY KEY,
-  received_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+-- Razorpay Standard Checkout records its order on the invoice and only marks
+-- the invoice paid after a verified signature and captured payment lookup.
 
 CREATE TABLE IF NOT EXISTS clients (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -63,12 +55,18 @@ CREATE TABLE IF NOT EXISTS invoices (
   status TEXT NOT NULL DEFAULT 'Awaiting payment' CHECK (status IN ('Awaiting payment', 'Overdue', 'Paid')),
   period_start DATE,
   period_end DATE,
+  razorpay_order_id TEXT,
+  razorpay_payment_id TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (user_id, id),
   UNIQUE (user_id, number),
   FOREIGN KEY (user_id, client_id) REFERENCES clients(user_id, id) ON DELETE RESTRICT
 );
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS razorpay_order_id TEXT;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS razorpay_payment_id TEXT;
 CREATE INDEX IF NOT EXISTS invoices_user_status_idx ON invoices(user_id, status, due_at);
+CREATE UNIQUE INDEX IF NOT EXISTS invoices_razorpay_order_idx ON invoices(razorpay_order_id) WHERE razorpay_order_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS invoices_razorpay_payment_idx ON invoices(razorpay_payment_id) WHERE razorpay_payment_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS tasks (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

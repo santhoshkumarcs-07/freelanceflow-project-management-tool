@@ -23,9 +23,9 @@
     "jsonwebtoken": "^9.0.3",
     "pdfkit": "^0.20.2",
     "pg": "^8.23.1",
+    "razorpay": "^2.9.8",
     "react": "latest",
     "react-dom": "latest",
-    "stripe": "^23.1.0",
     "vite": "latest",
     "zod": "^4.6.7"
   }

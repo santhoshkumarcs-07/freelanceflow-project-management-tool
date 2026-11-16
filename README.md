@@ -23,16 +23,13 @@ The included `render.yaml` defines a free Singapore web service and health check
 3. Render generates `JWT_SECRET`. Keep the Render compute plan on Free unless you intentionally choose paid hosting.
 4. Deploy and check `/api/health` on the generated `onrender.com` URL.
 
-## Configure Pro billing
+## Razorpay invoice checkout
 
-Pro checkout is powered by Stripe Checkout. Create a recurring Stripe Price for the Pro plan, then add these values as Render environment variables (never commit secret values):
+The app uses Razorpay Standard Checkout for one-time invoice payments. Configure `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` in `server/.env` locally or in the Render service environment. Never put the key secret in a Vite variable or commit it. Use Razorpay test keys for testing and switch to live keys only after account onboarding and payment flows are approved.
 
-- `STRIPE_SECRET_KEY`: a Stripe test key while developing, or a live key after launch review.
-- `STRIPE_PRO_PRICE_ID`: the recurring Price ID created in Stripe.
-- `STRIPE_WEBHOOK_SECRET`: the signing secret for a Stripe webhook endpoint at `https://<your-app>.onrender.com/api/stripe/webhook`.
-- `PUBLIC_APP_URL`: the app's canonical `https://<your-app>.onrender.com` URL.
+When a user pays an invoice, the server creates the order from the stored invoice amount, then verifies Razorpay's HMAC signature and fetches the payment status before marking the invoice paid. Invoice amounts are stored in paise at Razorpay and the invoice currency must be enabled for the merchant account. A successful browser callback alone does not mark an invoice paid. Manual “Mark paid” is available for payments received outside the app. Pro subscription billing is not the same as one-time invoice checkout and remains separate.
 
-Subscribe the webhook to `checkout.session.completed`, `checkout.session.async_payment_succeeded`, and `customer.subscription.created`, `customer.subscription.updated`, and `customer.subscription.deleted`. The server verifies the webhook signature and makes plan changes from these events; a checkout redirect by itself never grants Pro access. Configure the Stripe customer portal before enabling subscription management. Until the required settings exist, the UI explains that billing is unavailable and disables checkout. Free accounts can create up to two clients; PDF downloads require an active Pro subscription.
+For local testing, set the two Razorpay test credentials in `server/.env`, start the API and web app, sign in, and open an unpaid invoice to use “Pay online”. Razorpay provides test-mode payment methods and results. In Render, add both values to the service environment and redeploy. Existing invoices keep their currency; the merchant account must support that currency. New invoices continue to use the app's existing USD default.
 
 ## Current product scope
 
@@ -40,5 +37,5 @@ Subscribe the webhook to `checkout.session.completed`, `checkout.session.async_p
 - Client, project, task, and time-entry API operations, plus persistent timers.
 - Server-calculated invoices from unbilled time and server-generated PDF documents.
 - Dashboard and report metrics, with a sample-data loader for empty accounts.
-- Free plan enforcement for a maximum of two clients; PDF downloads require Pro.
-- Stripe-hosted Pro subscriptions, verified webhook fulfillment, and customer portal support once Stripe is configured.
+- Razorpay Standard Checkout for invoice payments with server-side signature and captured-payment verification.
+- Free plan enforcement for up to two clients; Pro subscription management is not currently connected.

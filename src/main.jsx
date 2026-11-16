@@ -9,7 +9,7 @@ const nav = [
 ];
 const emptyData = { clients: [], projects: [], invoices: [], entries: [], tasks: [] };
 const API_BASE = import.meta.env.VITE_API_BASE || '';
-const money = n => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n || 0);
+const money = (n, currency = 'USD') => new Intl.NumberFormat('en-US', { style: 'currency', currency, maximumFractionDigits: 0 }).format(n || 0);
 const day = d => d ? new Date(`${d}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'No date';
 async function api(path, options = {}) {
   const response = await fetch(`${API_BASE}/api${path}`, {
@@ -37,7 +37,7 @@ function App() {
   const [filter, setFilter] = useState('All projects');
   const [timer, setTimer] = useState(null);
   const [billingStatus, setBillingStatus] = useState(null);
-  const [billingBusy, setBillingBusy] = useState(false);
+  const [paymentBusy, setPaymentBusy] = useState('');
   const [now, setNow] = useState(Date.now());
   const [search, setSearch] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
@@ -61,6 +61,12 @@ function App() {
       if (!alive) return;
       setData(workspace); setTimer(workspace.timer); setDashboard(summary); setApiAvailable(true);
     }).catch(error => { if (alive) notify(error.message || 'Could not load your workspace.'); });
+    return () => { alive = false; };
+  }, [user]);
+  useEffect(() => {
+    if (!user) { setBillingStatus(null); return; }
+    let alive = true;
+    api('/billing/status').then(status => { if (alive) setBillingStatus(status); }).catch(() => {});
     return () => { alive = false; };
   }, [user]);
   useEffect(() => {
@@ -94,30 +100,50 @@ function App() {
     try { setBillingStatus(await api('/billing/status')); }
     catch (error) { notify(error.message); }
   };
-  const openBillingFlow = async flow => {
-    setBillingBusy(true);
+  const payInvoice = async invoice => {
+    setPaymentBusy(invoice.id);
     try {
-      const result = await api(`/billing/${flow}`, { method: 'POST', body: {} });
-      if (!result.url) throw new Error('Stripe did not return a billing page.');
-      window.location.assign(result.url);
-    } catch (error) { notify(error.message); setBillingBusy(false); }
+      if (!window.Razorpay) {
+        await new Promise((resolve, reject) => {
+          const existing = document.querySelector('script[data-razorpay-checkout]');
+          if (existing) { existing.addEventListener('load', resolve, { once: true }); existing.addEventListener('error', reject, { once: true }); return; }
+          const script = document.createElement('script');
+          script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+          script.async = true;
+          script.dataset.razorpayCheckout = 'true';
+          script.onload = resolve;
+          script.onerror = () => reject(new Error('Razorpay Checkout could not load. Check your connection and retry.'));
+          document.body.appendChild(script);
+        });
+      }
+      if (!window.Razorpay) throw new Error('Razorpay Checkout is unavailable.');
+      const order = await api(`/invoices/${invoice.id}/create-order`, { method: 'POST', body: {} });
+      const checkout = new window.Razorpay({
+        key: order.key_id,
+        amount: order.amount,
+        currency: order.currency,
+        name: 'FreelanceFlow',
+        description: `Invoice ${invoice.number || invoice.id}`,
+        order_id: order.order_id,
+        theme: { color: '#536c4f' },
+        modal: { ondismiss: () => { setPaymentBusy(''); notify('Payment was cancelled. The invoice is still unpaid.'); } },
+        handler: async response => {
+          try {
+            await api(`/invoices/${invoice.id}/verify-payment`, { method: 'POST', body: response });
+            await refreshWorkspace();
+            notify('Payment verified. Invoice marked paid.');
+          } catch (error) { notify(error.message); }
+          finally { setPaymentBusy(''); }
+        },
+      });
+      checkout.on('payment.failed', event => {
+        const message = event?.error?.description || event?.error?.reason || 'Payment failed. The invoice is still unpaid.';
+        notify(message);
+        setPaymentBusy('');
+      });
+      checkout.open();
+    } catch (error) { notify(error.message); setPaymentBusy(''); }
   };
-  useEffect(() => {
-    if (!user) return;
-    const params = new URLSearchParams(window.location.search);
-    const result = params.get('billing');
-    if (!result) return;
-    params.delete('billing');
-    const nextUrl = `${window.location.pathname}${params.size ? `?${params}` : ''}${window.location.hash}`;
-    window.history.replaceState({}, '', nextUrl);
-    if (result === 'cancelled') { notify('Checkout was cancelled. Your plan has not changed.'); return; }
-    if (result === 'success') {
-      api('/auth/me').then(({ user: current }) => {
-        setUser(current);
-        notify(current.plan === 'pro' ? 'Pro is active.' : 'Payment received. Your plan will update as Stripe confirms the subscription.');
-      }).catch(error => notify(error.message));
-    }
-  }, [user]);
   const activeProjects = data.projects.filter(p => p.status === 'In progress');
   const filteredClients = data.clients.filter(c => `${c.name} ${c.contact} ${c.email}`.toLowerCase().includes(search.trim().toLowerCase()));
   const outstanding = data.invoices.filter(i => i.status !== 'Paid').reduce((s, i) => s + i.amount, 0);
@@ -234,28 +260,26 @@ function App() {
         {page === 'Clients' && <><PageHeading title="Clients" subtitle="Good work starts with good relationships." action={search.trim() ? null : '＋ Add client'} onAction={() => setModal('client')} /><div className="toolbar"><label className="search local-search"><span>⌕</span><input placeholder="Find a client" value={search} onChange={e=>setSearch(e.target.value)}/></label><span className="result-count">{search.trim() ? `${filteredClients.length} found` : `${data.clients.length} clients`}</span></div>{filteredClients.length ? <div className="client-grid">{filteredClients.map(c=><article className="panel client-card" key={c.id}><div className="client-card-top"><div className="client-avatar" style={{background:c.color}}>{c.name.split(' ').map(x=>x[0]).slice(0,2).join('')}</div><div className="record-actions"><button type="button" onClick={()=>beginEdit('clients',c)}>Edit</button><button type="button" onClick={()=>deleteRecord('clients',c)}>Delete</button></div></div><h2>{c.name}</h2><p>{c.contact} · {c.email}</p><div className="client-card-bottom"><span>Default hourly rate</span><b>{money(c.rate)}<small>/hr</small></b></div><div className="client-card-bottom"><span>Active projects</span><b>{data.projects.filter(p=>p.clientId===c.id && p.status==='In progress').length}</b></div></article>)}{!search.trim()&&<button className="add-client-card" onClick={()=>setModal('client')}><span>＋</span><b>Add a client</b><small>Bring a new partnership into your workspace</small></button>}</div> : <div className="empty-clients" role="status"><span className="empty-client-icon">⌕</span><h2>{search.trim() ? `No existing clients named “${search.trim()}”` : 'No clients yet'}</h2><p>{search.trim() ? 'You can create one if this is a new client.' : 'Add your first client, or load a sample workspace from the dashboard.'}</p><button className="button button-primary" onClick={() => setModal('client')}>＋ New client</button></div>}<div className="demo-note"><span>i</span> Your client records are saved to your account.</div></>}
         {page === 'Tasks' && <><PageHeading title="Tasks" subtitle="Small next steps make the big work happen." action="＋ Add task" onAction={()=>setModal('task')} /><div className="panel tasks-page">{['To do','Completed'].map(status=><section key={status}><div className="task-section-head">{status}<span>{data.tasks.filter(t=>t.done===(status==='Completed')).length}</span></div>{data.tasks.filter(t=>t.done===(status==='Completed')).map(t=><div className="task-row task-page-row" key={t.id}><button className={`check-circle ${t.done?'checked':''}`} onClick={()=>toggleTask(t)}>{t.done?'✓':''}</button><span className="task-copy"><b className={t.done?'struck':''}>{t.title}</b><small>{projectName(t.projectId)}</small></span><span className="task-date">{t.due?`Due ${day(t.due)}`:'No due date'}</span><div className="record-actions"><button type="button" onClick={()=>beginEdit('tasks',t)}>Edit</button><button type="button" onClick={()=>deleteRecord('tasks',t)}>Delete</button></div></div>)}</section>)}</div></>}
         {page === 'Time' && <><PageHeading title="Time" subtitle="Know where your working hours go." action={timer?'■ Stop timer':'▶ Start timer'} onAction={()=>timer?closeTimer():setModal('timer')} /><div className="time-summary"><div className="panel"><span>This week</span><b>{hoursWeek.toFixed(1)}h</b><small>Across {new Set(data.entries.map(e=>e.projectId)).size} projects</small></div><div className="panel"><span>This month</span><b>{hoursMonth.toFixed(1)}h</b><small>Time recorded this month</small></div><div className="panel"><span>Unbilled</span><b>{money(unbilledAmount)}</b><small>Ready to invoice</small></div></div><div className="panel entries-panel"><div className="panel-header"><div><h2>Time entries</h2><p>Recent work, recorded as it happened</p></div><button className="button button-secondary" onClick={()=>setModal('quick')}>＋ Manual entry</button></div>{data.entries.map(e=><div className="entry-row" key={e.id}><span className="entry-date">{day(e.date)}</span><span className="entry-copy"><b>{e.note}</b><small>{projectName(e.projectId)} · {clientName(data.projects.find(p=>p.id===e.projectId)?.clientId)}</small></span><b>{e.hours}h</b>{e.invoiceId?<span className="entry-billed">Invoiced</span>:<div className="record-actions"><button type="button" onClick={()=>beginEdit('entries',e)}>Edit</button><button type="button" onClick={()=>deleteRecord('entries',e)}>Delete</button></div>}</div>)}</div></>}
-        {page === 'Invoices' && <><PageHeading title="Invoices" subtitle="Clear, professional billing for work well done." action="＋ New invoice" onAction={()=>setModal('invoice')} /><div className="time-summary invoice-summary"><div className="panel"><span>Outstanding</span><b>{money(outstanding)}</b><small>{data.invoices.filter(i=>i.status!=='Paid').length} awaiting payment</small></div><div className="panel"><span>Paid this year</span><b>{money(paidYear)}</b><small>{data.invoices.filter(i=>i.status==='Paid').length} invoice paid</small></div><div className="panel"><span>Overdue</span><b>{money(data.invoices.filter(i=>i.status==='Overdue').reduce((s,i)=>s+i.amount,0))}</b><small>Follow up when you’re ready</small></div></div><div className="panel invoice-list"><div className="list-title"><h2>All invoices</h2><span>{data.invoices.length} total</span></div>{data.invoices.map(inv=><div className="invoice-row" key={inv.id}><span className="invoice-icon">▤</span><span className="invoice-copy"><b>{clientName(inv.clientId)}</b><small>{inv.number || inv.id} · Issued {day(inv.date)} · Due {day(inv.due)}</small></span><span className="invoice-amount">{money(inv.amount)}</span><span className={`invoice-status ${inv.status.toLowerCase().replace(' ', '-')}`}>{inv.status}</span><button className="text-link" onClick={()=>user.plan==='pro'?downloadInvoice(inv):openPlanDetails()}>{user.plan==='pro'?'PDF ↗':'PDF · Pro'}</button><button className="text-link" onClick={()=>markInvoicePaid(inv)}>{inv.status==='Paid'?'Reopen':'Mark paid'}</button></div>)}</div></>}
+        {page === 'Invoices' && <><PageHeading title="Invoices" subtitle="Clear, professional billing for work well done." action="＋ New invoice" onAction={()=>setModal('invoice')} /><div className="time-summary invoice-summary"><div className="panel"><span>Outstanding</span><b>{money(outstanding)}</b><small>{data.invoices.filter(i=>i.status!=='Paid').length} awaiting payment</small></div><div className="panel"><span>Paid this year</span><b>{money(paidYear)}</b><small>{data.invoices.filter(i=>i.status==='Paid').length} invoice paid</small></div><div className="panel"><span>Overdue</span><b>{money(data.invoices.filter(i=>i.status==='Overdue').reduce((s,i)=>s+i.amount,0))}</b><small>Follow up when you’re ready</small></div></div><div className="panel invoice-list"><div className="list-title"><h2>All invoices</h2><span>{data.invoices.length} total</span></div>{data.invoices.map(inv=><div className="invoice-row" key={inv.id}><span className="invoice-icon">▤</span><span className="invoice-copy"><b>{clientName(inv.clientId)}</b><small>{inv.number || inv.id} · Issued {day(inv.date)} · Due {day(inv.due)}</small></span><span className="invoice-amount">{money(inv.amount, inv.currency || 'USD')}</span><span className={`invoice-status ${inv.status.toLowerCase().replace(' ', '-')}`}>{inv.status}</span>{inv.status!=='Paid'&&<button className="text-link" type="button" disabled={Boolean(paymentBusy)||billingStatus?.invoicePaymentsConfigured===false} onClick={()=>payInvoice(inv)}>{paymentBusy===inv.id?'Opening…':billingStatus?.invoicePaymentsConfigured===false?'Payments unavailable':'Pay online'}</button>}<button className="text-link" onClick={()=>user.plan==='pro'?downloadInvoice(inv):openPlanDetails()}>{user.plan==='pro'?'PDF ↗':'PDF · Pro'}</button><button className="text-link" onClick={()=>markInvoicePaid(inv)}>{inv.status==='Paid'?'Reopen':'Mark paid'}</button></div>)}</div></>}
         {page === 'Reports' && <><PageHeading title="Reports" subtitle="The numbers behind a sustainable independent practice." action="Export report" onAction={()=>window.print()} /><div className="time-summary"><div className="panel"><span>Revenue this month</span><b>{money(reportData?.summary.revenueMonth||0)}</b><small>Paid invoices issued this month</small></div><div className="panel"><span>Outstanding</span><b>{money(reportData?.summary.outstanding??outstanding)}</b><small>Across open invoices</small></div><div className="panel"><span>Billable hours</span><b>{Number(reportData?.summary.hoursMonth||0).toFixed(1)}h</b><small>Logged this month</small></div></div><div className="panel hours-panel report-chart"><div className="panel-header"><div><h2>Revenue over time</h2><p>Monthly paid invoices, in USD</p></div><span className="range-label">Last 6 months</span></div><div className="chart"><div className="chart-guides"><span>{money(reportMax)}</span><span>{money(reportMax*.75)}</span><span>{money(reportMax*.5)}</span><span>{money(reportMax*.25)}</span><span>$0</span></div><div className="chart-bars">{reportMonths.map((item,i)=><div className="chart-col" key={`${item.month}-${i}`}><div className="bar-zone"><i className={i===reportMonths.length-1?'today':''} style={{height:`${Math.max(item.revenue?2:0,item.revenue/reportMax*100)}%`}}/></div><span>{item.month}</span></div>)}</div></div></div><div className="panel full-table"><div className="list-title"><h2>Project budget health</h2><span>Tracked against project budgets</span></div>{(reportData?.budgets||[]).map(p=><div className="project-row report-project" key={p.id}><div className="project-cell"><i className="project-color" style={{background:p.color}}/><span><b>{p.name}</b><small>{clientName(p.clientId)}</small></span></div><div className="budget-cell"><div className="budget-text"><span>{p.budget?Math.round(p.hours*(data.clients.find(c=>c.id===p.clientId)?.rate||100)/p.budget*100):0}% used</span><small>{money(p.budget)}</small></div><div className="budget-track"><i style={{width:`${p.budget?Math.min(100,p.hours*(data.clients.find(c=>c.id===p.clientId)?.rate||100)/p.budget*100):0}%`,background:p.color}}/></div></div></div>)}</div></>}
       </div>
     </main>
-    {modal === 'plan' ? <PlanModal user={user} status={billingStatus} busy={billingBusy} onClose={closeModal} onCheckout={() => openBillingFlow('checkout')} onPortal={() => openBillingFlow('portal')} /> : modal && <Modal type={modal} data={data} editing={editing} onClose={closeModal} onAdd={addRecord} onUpdate={updateRecord} onStart={startTimer} onEntry={saveTimeEntry} onInvoice={createInvoice} />}
+    {modal === 'plan' ? <PlanModal user={user} status={billingStatus} onClose={closeModal} /> : modal && <Modal type={modal} data={data} editing={editing} onClose={closeModal} onAdd={addRecord} onUpdate={updateRecord} onStart={startTimer} onEntry={saveTimeEntry} onInvoice={createInvoice} />}
     {toast && <div className="toast"><span>✓</span>{toast}</div>}
   </div>;
 }
-function PlanModal({ user, status, busy, onClose, onCheckout, onPortal }) {
+function PlanModal({ user, status, onClose }) {
   const pro = user.plan === 'pro';
   return <div className="modal-backdrop" onMouseDown={e=>e.target===e.currentTarget&&onClose()}><section className="modal plan-modal" role="dialog" aria-modal="true" aria-labelledby="plan-title">
     <div className="modal-head"><div><div className="eyebrow">WORKSPACE BILLING</div><h2 id="plan-title">Your plan</h2></div><button type="button" className="modal-close" onClick={onClose} aria-label="Close">×</button></div>
     <div className="modal-fields">
       <div className="plan-summary"><span className="plan-summary-label">CURRENT PLAN</span><strong>{pro ? 'Pro' : 'Free'}</strong><span>{pro ? 'Unlimited clients and PDF invoice downloads.' : `${status?.plan === 'free' ? 'Up to two clients.' : 'Checking your current plan…'}`}</span></div>
-      {!pro && <div className="plan-benefits"><h3>Pro includes</h3><ul><li>Unlimited clients</li><li>Downloadable PDF invoices</li><li>Subscription management through Stripe</li></ul></div>}
-      {status?.checkoutConfigured && !pro ? <p className="billing-copy">Continue to Stripe Checkout to review the recurring price and payment terms before subscribing.</p> : null}
-      {status && !status.checkoutConfigured && !pro ? <div className="billing-setup-note"><b>Pro checkout is not connected yet.</b><span>The owner needs to add a Stripe secret key, Pro price ID, webhook signing secret, and public app URL in Render. No charge can be made from this screen until billing is configured.</span></div> : null}
+      {!pro && <div className="plan-benefits"><h3>Pro includes</h3><ul><li>Unlimited clients</li><li>Downloadable PDF invoices</li><li>Invoice payments through Razorpay Checkout</li></ul></div>}
+      {!pro && <div className="billing-setup-note"><b>{status?.invoicePaymentsConfigured ? 'Razorpay invoice payments are ready.' : 'Razorpay is not configured yet.'}</b><span>Online invoice payments are available from each unpaid invoice. Pro subscription billing is separate and is not enabled by a one-time invoice payment.</span></div>}
       {!status && <p className="billing-copy">Loading plan and billing options…</p>}
-      {pro && status?.portalConfigured && <p className="billing-copy">Manage payment methods, invoices, or cancellation in the Stripe customer portal.</p>}
-      {pro && status && !status.portalConfigured && <div className="billing-setup-note"><b>Plan is active.</b><span>Billing management is not available for this account yet.</span></div>}
+      {pro && <div className="billing-setup-note"><b>Pro plan is active.</b><span>Subscription management is not connected yet. Contact the workspace owner for plan changes.</span></div>}
     </div>
-    <div className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Close</button>{!pro && <button className="button button-primary" type="button" onClick={onCheckout} disabled={busy||!status?.checkoutConfigured}>{busy?'Opening Stripe…':'Continue to Pro'}</button>}{pro && status?.portalConfigured && <button className="button button-primary" type="button" onClick={onPortal} disabled={busy}>{busy?'Opening Stripe…':'Manage subscription'}</button>}</div>
+    <div className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Close</button></div>
   </section></div>;
 }
 function formatElapsed(ms) { const total=Math.floor(ms/1000), h=String(Math.floor(total/3600)).padStart(2,'0'), m=String(Math.floor(total%3600/60)).padStart(2,'0'), s=String(total%60).padStart(2,'0'); return `${h}:${m}:${s}`; }

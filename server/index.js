@@ -8,7 +8,8 @@ import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import PDFDocument from 'pdfkit';
-import Stripe from 'stripe';
+import Razorpay from 'razorpay';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { pool, initializeDatabase, transaction } from './db.js';
 import {
@@ -21,29 +22,25 @@ const app = express();
 const port = Number(process.env.PORT || 3001);
 const jwtSecret = process.env.JWT_SECRET;
 if (!jwtSecret || jwtSecret.length < 32) throw new Error('JWT_SECRET must be configured with at least 32 characters.');
-const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
-const stripePriceId = process.env.STRIPE_PRO_PRICE_ID;
-const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-const publicAppUrl = process.env.PUBLIC_APP_URL || (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:3001');
+const razorpayKeyId = process.env.RAZORPAY_KEY_ID;
+const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET;
+const razorpay = razorpayKeyId && razorpayKeySecret ? new Razorpay({ key_id: razorpayKeyId, key_secret: razorpayKeySecret }) : null;
 
 app.disable('x-powered-by');
 if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
-app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: { directives: {
+    scriptSrc: ["'self'", 'https://checkout.razorpay.com'],
+    connectSrc: ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
+    frameSrc: ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
+    imgSrc: ["'self'", 'data:', 'https://*.razorpay.com'],
+    fontSrc: ["'self'", 'data:', 'https://*.razorpay.com'],
+    formAction: ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
+  } },
+}));
 app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:5173', credentials: true }));
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-
-// Stripe requires the untouched request bytes to verify webhook signatures.
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), asyncRoute(async (req, res) => {
-  if (!stripe || !stripeWebhookSecret) throw new HttpError(503, 'Stripe webhook is not configured.');
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, req.get('stripe-signature'), stripeWebhookSecret);
-  } catch {
-    throw new HttpError(400, 'Invalid Stripe webhook signature.');
-  }
-  await processStripeEvent(event);
-  res.json({ received: true });
-}));
 
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
@@ -89,38 +86,6 @@ function requireAuth(req, res, next) {
 }
 const auth = [requireAuth];
 
-async function processStripeEvent(event) {
-  let subscriptionEvent = null;
-  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
-    const session = event.data.object;
-    if (session.mode === 'subscription' && session.subscription) {
-      const subscriptionId = typeof session.subscription === 'string' ? session.subscription : session.subscription.id;
-      subscriptionEvent = await stripe.subscriptions.retrieve(subscriptionId);
-      subscriptionEvent.userId = session.client_reference_id || session.metadata?.userId || subscriptionEvent.metadata?.userId;
-      subscriptionEvent.customer = session.customer || subscriptionEvent.customer;
-    }
-  } else if (event.type.startsWith('customer.subscription.')) {
-    subscriptionEvent = event.data.object;
-  }
-
-  await transaction(async client => {
-    const inserted = await client.query('INSERT INTO stripe_webhook_events(id) VALUES($1) ON CONFLICT DO NOTHING RETURNING id', [event.id]);
-    if (!inserted.rowCount || !subscriptionEvent) return;
-
-    const rawUserId = subscriptionEvent.userId || subscriptionEvent.metadata?.userId;
-    const userId = typeof rawUserId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawUserId) ? rawUserId : null;
-    const customerId = typeof subscriptionEvent.customer === 'string' ? subscriptionEvent.customer : subscriptionEvent.customer?.id;
-    const status = subscriptionEvent.status || 'incomplete';
-    const plan = ['active', 'trialing'].includes(status) ? 'pro' : 'free';
-    await client.query(`UPDATE users SET plan=$1,
-      stripe_customer_id=COALESCE($2,stripe_customer_id),stripe_subscription_id=$3,
-      stripe_subscription_status=$4,stripe_event_created=$5
-      WHERE stripe_event_created <= $5 AND
-        (($6::uuid IS NOT NULL AND id=$6) OR ($6::uuid IS NULL AND stripe_customer_id=$2))`,
-      [plan, customerId || null, subscriptionEvent.id || null, status, event.created, userId]);
-  });
-}
-
 app.get('/api/health', asyncRoute(async (_req, res) => {
   await pool.query('SELECT 1');
   res.json({ ok: true, service: 'freelanceflow-api' });
@@ -163,48 +128,76 @@ app.get('/api/auth/me', auth, asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/billing/status', auth, asyncRoute(async (req, res) => {
-  const result = await pool.query('SELECT plan,stripe_customer_id,stripe_subscription_status FROM users WHERE id=$1', [userIdOf(req)]);
+  const result = await pool.query('SELECT plan FROM users WHERE id=$1', [userIdOf(req)]);
   if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
   const account = result.rows[0];
   res.json({
     plan: account.plan,
-    checkoutConfigured: Boolean(stripe && stripePriceId && stripeWebhookSecret && publicAppUrl),
-    portalConfigured: Boolean(stripe && account.stripe_customer_id && publicAppUrl),
-    subscriptionStatus: account.stripe_subscription_status,
+    checkoutConfigured: Boolean(razorpay),
+    invoicePaymentsConfigured: Boolean(razorpay),
+    keyId: razorpay ? razorpayKeyId : null,
   });
 }));
 
-app.post('/api/billing/checkout', auth, asyncRoute(async (req, res) => {
-  if (!stripe || !stripePriceId || !stripeWebhookSecret || !publicAppUrl) throw new HttpError(503, 'Pro checkout is not configured yet.');
-  const result = await pool.query('SELECT id,name,email,plan,stripe_customer_id,stripe_subscription_status FROM users WHERE id=$1', [userIdOf(req)]);
-  if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
-  const account = result.rows[0];
-  if (account.plan === 'pro' && ['active', 'trialing'].includes(account.stripe_subscription_status)) {
-    throw new HttpError(409, 'Your Pro subscription is already active.');
+const paymentCallbackSchema = z.object({
+  razorpay_order_id: z.string().min(1).max(100),
+  razorpay_payment_id: z.string().min(1).max(100),
+  razorpay_signature: z.string().regex(/^[a-f0-9]{64}$/i),
+});
+app.post('/api/invoices/:id/create-order', auth, asyncRoute(async (req, res) => {
+  if (!razorpay) throw new HttpError(503, 'Razorpay checkout is not configured on the server.');
+  const id = idParam(req.params.id);
+  const result = await pool.query('SELECT id,number,amount,currency,status FROM invoices WHERE id=$1 AND user_id=$2', [id,userIdOf(req)]);
+  if (!result.rowCount) throw new HttpError(404, 'Invoice not found.');
+  const invoice = result.rows[0];
+  if (invoice.status === 'Paid') throw new HttpError(409, 'This invoice is already paid.');
+  const currency = invoice.currency.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) throw new HttpError(422, 'Invoice currency is not valid for Razorpay.');
+  const amount = Math.round(Number(invoice.amount) * 100);
+  if (!Number.isSafeInteger(amount) || amount < 100) throw new HttpError(422, 'Razorpay requires a payment of at least 100 paise.');
+  try {
+    const order = await razorpay.orders.create({
+      amount, currency, receipt: invoice.number,
+      notes: { invoice_id: invoice.id, user_id: userIdOf(req) },
+    });
+    const linked = await pool.query(`UPDATE invoices SET razorpay_order_id=$1
+      WHERE id=$2 AND user_id=$3 AND status<>'Paid' RETURNING id`, [order.id,id,userIdOf(req)]);
+    if (!linked.rowCount) throw new HttpError(409, 'This invoice was already paid. Reload the invoice list.');
+    res.status(201).json({ order_id: order.id, amount: order.amount, currency: order.currency, key_id: razorpayKeyId });
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    console.error('Razorpay order creation failed:', error?.statusCode || error?.error?.code || 'provider error');
+    throw new HttpError(502, 'Razorpay could not create the payment order. Check that your account supports this invoice currency.');
   }
-  const session = await stripe.checkout.sessions.create({
-    mode: 'subscription',
-    line_items: [{ price: stripePriceId, quantity: 1 }],
-    ...(account.stripe_customer_id ? { customer: account.stripe_customer_id } : { customer_email: account.email }),
-    client_reference_id: account.id,
-    metadata: { userId: account.id },
-    subscription_data: { metadata: { userId: account.id } },
-    success_url: `${publicAppUrl}/?billing=success`,
-    cancel_url: `${publicAppUrl}/?billing=cancelled`,
-  });
-  res.json({ url: session.url });
 }));
 
-app.post('/api/billing/portal', auth, asyncRoute(async (req, res) => {
-  if (!stripe || !publicAppUrl) throw new HttpError(503, 'Subscription management is not configured yet.');
-  const result = await pool.query('SELECT stripe_customer_id FROM users WHERE id=$1', [userIdOf(req)]);
-  if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
-  if (!result.rows[0].stripe_customer_id) throw new HttpError(409, 'No billing profile is linked to this account yet.');
-  const session = await stripe.billingPortal.sessions.create({
-    customer: result.rows[0].stripe_customer_id,
-    return_url: `${publicAppUrl}/?billing=returned`,
-  });
-  res.json({ url: session.url });
+app.post('/api/invoices/:id/verify-payment', auth, asyncRoute(async (req, res) => {
+  if (!razorpay) throw new HttpError(503, 'Razorpay checkout is not configured on the server.');
+  const id = idParam(req.params.id);
+  const input = body(paymentCallbackSchema, req.body);
+  const invoiceResult = await pool.query('SELECT id,amount,currency,status,razorpay_order_id,razorpay_payment_id FROM invoices WHERE id=$1 AND user_id=$2', [id,userIdOf(req)]);
+  if (!invoiceResult.rowCount) throw new HttpError(404, 'Invoice not found.');
+  const invoice = invoiceResult.rows[0];
+  if (invoice.razorpay_order_id !== input.razorpay_order_id) throw new HttpError(400, 'Payment order does not match this invoice.');
+  const expected = createHmac('sha256', razorpayKeySecret).update(`${input.razorpay_order_id}|${input.razorpay_payment_id}`).digest();
+  const supplied = Buffer.from(input.razorpay_signature, 'hex');
+  if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) throw new HttpError(400, 'Payment signature is invalid.');
+  if (invoice.status === 'Paid' && invoice.razorpay_payment_id === input.razorpay_payment_id) {
+    return res.json({ verified: true, status: 'Paid', invoiceId: id });
+  }
+  let payment;
+  try { payment = await razorpay.payments.fetch(input.razorpay_payment_id); }
+  catch { throw new HttpError(502, 'Could not confirm payment status with Razorpay.'); }
+  if (payment.order_id !== input.razorpay_order_id) throw new HttpError(400, 'Payment is not attached to this order.');
+  if (payment.status !== 'captured') throw new HttpError(409, 'Payment has not been captured yet. The invoice remains unpaid.');
+  if (payment.currency !== invoice.currency.trim().toUpperCase() || Number(payment.amount) !== Math.round(Number(invoice.amount) * 100)) {
+    throw new HttpError(400, 'The captured payment amount does not match this invoice.');
+  }
+  const updated = await pool.query(`UPDATE invoices SET status='Paid',razorpay_payment_id=$1
+    WHERE id=$2 AND user_id=$3 AND razorpay_order_id=$4 AND status<>'Paid'
+    RETURNING id`, [payment.id,id,userIdOf(req),input.razorpay_order_id]);
+  if (!updated.rowCount) throw new HttpError(409, 'Invoice payment state changed; reload and check the invoice.');
+  res.json({ verified: true, status: 'Paid', invoiceId: id });
 }));
 
 app.get('/api/data', auth, asyncRoute(async (req, res) => {
