@@ -397,13 +397,6 @@ app.post('/api/invoices', auth, asyncRoute(async (req, res) => {
   });
   res.status(201).json(invoice);
 }));
-app.patch('/api/invoices/:id/status', auth, asyncRoute(async (req, res) => {
-  const input = body(z.object({ status: z.enum(['Awaiting payment','Paid']) }), req.body);
-  const result = await pool.query(`UPDATE invoices SET status=$3 WHERE user_id=$1 AND id=$2
-    RETURNING id,number,client_id,amount,currency,issued_at,due_at,status,period_start,period_end`, [userIdOf(req),idParam(req.params.id),input.status]);
-  if (!result.rowCount) throw new HttpError(404, 'Invoice not found.');
-  res.json(invoiceDto(result.rows[0]));
-}));
 app.get('/api/invoices/:id/pdf', auth, asyncRoute(async (req, res) => {
   const account = await pool.query('SELECT plan FROM users WHERE id=$1', [userIdOf(req)]);
   if (!account.rowCount) throw new HttpError(401, 'Your account is no longer available.');
