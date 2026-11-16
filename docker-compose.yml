@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: freelanceflow
+      POSTGRES_USER: freelanceflow
+      POSTGRES_PASSWORD: local-dev-password
+    ports:
+      - "5432:5432"
+    volumes:
+      - freelanceflow_db:/var/lib/postgresql/data
+
+volumes:
+  freelanceflow_db:
