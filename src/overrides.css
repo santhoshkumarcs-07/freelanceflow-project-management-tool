@@ -56,6 +56,20 @@
 .auth-switch { margin: 18px 0 0; color: #777d75; font-size: 11px; text-align: center; }
 .auth-switch button { padding: 0; border: 0; background: transparent; color: #55735a; font-size: inherit; font-weight: 650; }
 .auth-note { margin: 22px 0 0; padding-top: 14px; border-top: 1px solid #eff0ed; color: #969b94; font-size: 9px; line-height: 1.55; text-align: center; }
+
+.plan-summary { display: flex; flex-direction: column; gap: 6px; padding: 15px; border: 1px solid #e8ebe6; border-radius: 7px; background: #f8f9f7; }
+.plan-summary-label { color: #8c9289; font-size: 9px; font-weight: 650; letter-spacing: .8px; }
+.plan-summary strong { color: #303a30; font: 650 23px/1.2 'Manrope', sans-serif; }
+.plan-summary > span:last-child, .billing-copy { color: #747b72; font-size: 11px; line-height: 1.55; }
+.plan-benefits { margin-top: 17px; }
+.plan-benefits h3 { margin: 0 0 9px; color: #353b34; font-size: 11px; font-weight: 650; }
+.plan-benefits ul { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.plan-benefits li { display: flex; align-items: center; gap: 8px; color: #656c63; font-size: 11px; }
+.plan-benefits li::before { content: '✓'; color: #648067; font-weight: 700; }
+.billing-copy { margin: 14px 0 0; }
+.billing-setup-note { display: flex; flex-direction: column; gap: 5px; margin-top: 14px; padding: 11px 12px; border: 1px solid #e9e3d2; border-radius: 6px; background: #fbf9f2; color: #776b4c; font-size: 10px; line-height: 1.55; }
+.billing-setup-note span { color: #827a67; }
+.plan-modal .modal-actions .button:disabled { cursor: not-allowed; opacity: .5; }
 .auth-error, .auth-api-error { margin-bottom: 14px; padding: 10px 12px; border-radius: 5px; font-size: 10px; line-height: 1.5; }
 .auth-error { border: 1px solid #efd8d0; background: #fbf1ed; color: #965943; }
 .auth-api-error { display: flex; flex-direction: column; gap: 3px; border: 1px solid #e8e4d6; background: #f9f7ef; color: #786c4e; }

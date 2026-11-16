@@ -8,6 +8,7 @@ import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import PDFDocument from 'pdfkit';
+import Stripe from 'stripe';
 import { z } from 'zod';
 import { pool, initializeDatabase, transaction } from './db.js';
 import {
@@ -20,11 +21,30 @@ const app = express();
 const port = Number(process.env.PORT || 3001);
 const jwtSecret = process.env.JWT_SECRET;
 if (!jwtSecret || jwtSecret.length < 32) throw new Error('JWT_SECRET must be configured with at least 32 characters.');
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+const stripePriceId = process.env.STRIPE_PRO_PRICE_ID;
+const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+const publicAppUrl = process.env.PUBLIC_APP_URL || (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:3001');
 
 app.disable('x-powered-by');
 if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:5173', credentials: true }));
+const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// Stripe requires the untouched request bytes to verify webhook signatures.
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), asyncRoute(async (req, res) => {
+  if (!stripe || !stripeWebhookSecret) throw new HttpError(503, 'Stripe webhook is not configured.');
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.get('stripe-signature'), stripeWebhookSecret);
+  } catch {
+    throw new HttpError(400, 'Invalid Stripe webhook signature.');
+  }
+  await processStripeEvent(event);
+  res.json({ received: true });
+}));
+
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
 if (process.env.NODE_ENV !== 'production') {
@@ -42,7 +62,6 @@ const cookieOptions = {
   path: '/',
   maxAge: 7 * 24 * 60 * 60 * 1000,
 };
-const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const body = (schema, value) => schema.parse(value);
 const isoDate = d => d instanceof Date ? d.toISOString().slice(0, 10) : d;
 const userIdOf = req => req.userId;
@@ -69,6 +88,38 @@ function requireAuth(req, res, next) {
   }
 }
 const auth = [requireAuth];
+
+async function processStripeEvent(event) {
+  let subscriptionEvent = null;
+  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+    const session = event.data.object;
+    if (session.mode === 'subscription' && session.subscription) {
+      const subscriptionId = typeof session.subscription === 'string' ? session.subscription : session.subscription.id;
+      subscriptionEvent = await stripe.subscriptions.retrieve(subscriptionId);
+      subscriptionEvent.userId = session.client_reference_id || session.metadata?.userId || subscriptionEvent.metadata?.userId;
+      subscriptionEvent.customer = session.customer || subscriptionEvent.customer;
+    }
+  } else if (event.type.startsWith('customer.subscription.')) {
+    subscriptionEvent = event.data.object;
+  }
+
+  await transaction(async client => {
+    const inserted = await client.query('INSERT INTO stripe_webhook_events(id) VALUES($1) ON CONFLICT DO NOTHING RETURNING id', [event.id]);
+    if (!inserted.rowCount || !subscriptionEvent) return;
+
+    const rawUserId = subscriptionEvent.userId || subscriptionEvent.metadata?.userId;
+    const userId = typeof rawUserId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawUserId) ? rawUserId : null;
+    const customerId = typeof subscriptionEvent.customer === 'string' ? subscriptionEvent.customer : subscriptionEvent.customer?.id;
+    const status = subscriptionEvent.status || 'incomplete';
+    const plan = ['active', 'trialing'].includes(status) ? 'pro' : 'free';
+    await client.query(`UPDATE users SET plan=$1,
+      stripe_customer_id=COALESCE($2,stripe_customer_id),stripe_subscription_id=$3,
+      stripe_subscription_status=$4,stripe_event_created=$5
+      WHERE stripe_event_created <= $5 AND
+        (($6::uuid IS NOT NULL AND id=$6) OR ($6::uuid IS NULL AND stripe_customer_id=$2))`,
+      [plan, customerId || null, subscriptionEvent.id || null, status, event.created, userId]);
+  });
+}
 
 app.get('/api/health', asyncRoute(async (_req, res) => {
   await pool.query('SELECT 1');
@@ -109,6 +160,51 @@ app.get('/api/auth/me', auth, asyncRoute(async (req, res) => {
   const result = await pool.query('SELECT id,name,email,plan FROM users WHERE id=$1', [userIdOf(req)]);
   if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
   res.json({ user: result.rows[0] });
+}));
+
+app.get('/api/billing/status', auth, asyncRoute(async (req, res) => {
+  const result = await pool.query('SELECT plan,stripe_customer_id,stripe_subscription_status FROM users WHERE id=$1', [userIdOf(req)]);
+  if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
+  const account = result.rows[0];
+  res.json({
+    plan: account.plan,
+    checkoutConfigured: Boolean(stripe && stripePriceId && stripeWebhookSecret && publicAppUrl),
+    portalConfigured: Boolean(stripe && account.stripe_customer_id && publicAppUrl),
+    subscriptionStatus: account.stripe_subscription_status,
+  });
+}));
+
+app.post('/api/billing/checkout', auth, asyncRoute(async (req, res) => {
+  if (!stripe || !stripePriceId || !stripeWebhookSecret || !publicAppUrl) throw new HttpError(503, 'Pro checkout is not configured yet.');
+  const result = await pool.query('SELECT id,name,email,plan,stripe_customer_id,stripe_subscription_status FROM users WHERE id=$1', [userIdOf(req)]);
+  if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
+  const account = result.rows[0];
+  if (account.plan === 'pro' && ['active', 'trialing'].includes(account.stripe_subscription_status)) {
+    throw new HttpError(409, 'Your Pro subscription is already active.');
+  }
+  const session = await stripe.checkout.sessions.create({
+    mode: 'subscription',
+    line_items: [{ price: stripePriceId, quantity: 1 }],
+    ...(account.stripe_customer_id ? { customer: account.stripe_customer_id } : { customer_email: account.email }),
+    client_reference_id: account.id,
+    metadata: { userId: account.id },
+    subscription_data: { metadata: { userId: account.id } },
+    success_url: `${publicAppUrl}/?billing=success`,
+    cancel_url: `${publicAppUrl}/?billing=cancelled`,
+  });
+  res.json({ url: session.url });
+}));
+
+app.post('/api/billing/portal', auth, asyncRoute(async (req, res) => {
+  if (!stripe || !publicAppUrl) throw new HttpError(503, 'Subscription management is not configured yet.');
+  const result = await pool.query('SELECT stripe_customer_id FROM users WHERE id=$1', [userIdOf(req)]);
+  if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
+  if (!result.rows[0].stripe_customer_id) throw new HttpError(409, 'No billing profile is linked to this account yet.');
+  const session = await stripe.billingPortal.sessions.create({
+    customer: result.rows[0].stripe_customer_id,
+    return_url: `${publicAppUrl}/?billing=returned`,
+  });
+  res.json({ url: session.url });
 }));
 
 app.get('/api/data', auth, asyncRoute(async (req, res) => {
@@ -316,6 +412,9 @@ app.patch('/api/invoices/:id/status', auth, asyncRoute(async (req, res) => {
   res.json(invoiceDto(result.rows[0]));
 }));
 app.get('/api/invoices/:id/pdf', auth, asyncRoute(async (req, res) => {
+  const account = await pool.query('SELECT plan FROM users WHERE id=$1', [userIdOf(req)]);
+  if (!account.rowCount) throw new HttpError(401, 'Your account is no longer available.');
+  if (account.rows[0].plan !== 'pro') throw new HttpError(403, 'PDF downloads are included with the Pro plan.');
   const result = await pool.query(`SELECT i.id,i.number,i.amount,i.currency,i.issued_at,i.due_at,i.status,c.name AS client_name
     FROM invoices i JOIN clients c ON c.user_id=i.user_id AND c.id=i.client_id WHERE i.user_id=$1 AND i.id=$2`, [userIdOf(req),idParam(req.params.id)]);
   if (!result.rowCount) throw new HttpError(404, 'Invoice not found.');
