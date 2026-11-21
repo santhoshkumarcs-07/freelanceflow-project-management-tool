@@ -739,8 +739,8 @@ app.get('/api/reports/pdf', auth, asyncRoute(async (req, res) => {
     pdf.text(`${percent}%`,left+455,y,{width:44,align:'right'});
     y+=20;
   });
-  pdf.strokeColor('#dfe4dc').moveTo(left,780).lineTo(right,780).stroke();
-  pdf.fillColor('#8a9087').font('Helvetica').fontSize(8).text('FreelanceFlow · Workspace report · Generated from saved account data',left,791,{width});
+  pdf.strokeColor('#dfe4dc').moveTo(left,770).lineTo(right,770).stroke();
+  pdf.fillColor('#8a9087').font('Helvetica').fontSize(8).text('FreelanceFlow · Workspace report · Generated from saved account data',left,780,{width});
   pdf.end();
 }));
 
