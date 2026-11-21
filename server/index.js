@@ -682,7 +682,7 @@ app.get('/api/reports/pdf', auth, asyncRoute(async (req, res) => {
       COALESCE(sum(t.hours),0)::numeric AS hours
       FROM projects p JOIN clients c ON c.user_id=p.user_id AND c.id=p.client_id
       LEFT JOIN time_entries t ON t.project_id=p.id AND t.user_id=p.user_id
-      WHERE p.user_id=$1 AND p.status='In progress' GROUP BY p.id,c.name ORDER BY p.due_date NULLS LAST`, [uid]),
+      WHERE p.user_id=$1 AND p.status='In progress' GROUP BY p.id,c.name,c.hourly_rate ORDER BY p.due_date NULLS LAST`, [uid]),
   ]);
   const metrics = summary.rows[0];
   const currency = 'USD';
