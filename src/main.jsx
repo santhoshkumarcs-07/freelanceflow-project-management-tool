@@ -10,7 +10,15 @@ const nav = [
 const emptyData = { clients: [], projects: [], invoices: [], entries: [], tasks: [] };
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 const money = (n, currency = 'USD') => new Intl.NumberFormat('en-US', { style: 'currency', currency, maximumFractionDigits: 0 }).format(n || 0);
-const day = d => d ? new Date(`${d}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'No date';
+const day = d => {
+  if (!d) return 'No date';
+  const key = d instanceof Date
+    ? `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+    : String(d).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return 'No date';
+  const parsed = new Date(`${key}T12:00:00`);
+  return Number.isNaN(parsed.getTime()) ? 'No date' : parsed.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+};
 async function api(path, options = {}) {
   const response = await fetch(`${API_BASE}/api${path}`, {
     credentials: 'include',
