@@ -25,7 +25,7 @@ The included `render.yaml` defines a free Singapore web service and health check
 
 ## Razorpay invoice checkout
 
-Billing has separate Demo, Test, and Live modes. Demo never contacts Razorpay and previews Pro features, including unlimited clients and downloadable PDFs. Test uses Razorpay sandbox credentials. Live checkout can create real invoice payments and a ₹499/month Pro subscription. Invoice payments are accepted only in Live mode, and an invoice is marked paid only after server-side signature and captured-payment checks. Reports can be printed or saved as a PDF without application navigation.
+Billing has separate Demo, Test, and Live modes. Demo never contacts Razorpay and previews Pro features, including unlimited clients and downloadable PDFs. Test uses Razorpay sandbox credentials. Live checkout can create real invoice payments and a ₹499/month Pro subscription. Invoice payments are accepted only in Live mode, and an invoice is marked paid only after server-side signature and captured-payment checks. Demo and Pro workspaces can download a server-generated PDF report without application navigation.
 
 Configure `RAZORPAY_TEST_KEY_ID`, `RAZORPAY_TEST_KEY_SECRET`, `RAZORPAY_TEST_WEBHOOK_SECRET`, and optionally `RAZORPAY_PRO_PLAN_ID_TEST` for sandbox use. Configure the corresponding `RAZORPAY_LIVE_*` values for production. `PRO_MONTHLY_PRICE_INR` defaults to 499. Never expose either key secret or webhook secret to Vite or commit them. The server can create and cache the monthly plan automatically if a plan ID is omitted.
 

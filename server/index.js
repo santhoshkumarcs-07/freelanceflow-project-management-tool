@@ -662,6 +662,88 @@ app.get('/api/reports', auth, asyncRoute(async (req, res) => {
   res.json({ summary: { revenueMonth: Number(summary.rows[0].revenue_month), outstanding: Number(summary.rows[0].outstanding), hoursMonth: Number(summary.rows[0].hours_month) }, months: byMonth.rows.map(r=>({ month:r.month, revenue:Number(r.revenue) })), budgets: budgets.rows.map(projectDto) });
 }));
 
+app.get('/api/reports/pdf', auth, asyncRoute(async (req, res) => {
+  const uid = userIdOf(req);
+  const account = await pool.query('SELECT plan,billing_mode FROM users WHERE id=$1', [uid]);
+  if (!account.rowCount) throw new HttpError(401, 'Your account is no longer available.');
+  if (account.rows[0].plan !== 'pro' && account.rows[0].billing_mode !== 'demo') {
+    throw new HttpError(403, 'PDF report downloads are included with Pro. Switch to Demo to preview this feature.');
+  }
+  const [summary, months, projects] = await Promise.all([
+    pool.query(`SELECT COALESCE(sum(amount) FILTER(WHERE status='Paid' AND issued_at>=date_trunc('month',CURRENT_DATE)),0)::numeric AS revenue_month,
+      COALESCE(sum(amount) FILTER(WHERE status<>'Paid'),0)::numeric AS outstanding,
+      COALESCE((SELECT sum(hours) FROM time_entries WHERE user_id=$1 AND work_date>=date_trunc('month',CURRENT_DATE)::date),0)::numeric AS hours_month
+      FROM invoices WHERE user_id=$1`, [uid]),
+    pool.query(`SELECT to_char(date_trunc('month',issued_at),'Mon YYYY') AS month,
+      COALESCE(sum(amount) FILTER(WHERE status='Paid'),0)::numeric AS revenue
+      FROM invoices WHERE user_id=$1 AND issued_at>=date_trunc('month',CURRENT_DATE)-interval '5 months'
+      GROUP BY date_trunc('month',issued_at) ORDER BY date_trunc('month',issued_at)`, [uid]),
+    pool.query(`SELECT p.name,c.name AS client_name,p.budget,c.hourly_rate,
+      COALESCE(sum(t.hours),0)::numeric AS hours
+      FROM projects p JOIN clients c ON c.user_id=p.user_id AND c.id=p.client_id
+      LEFT JOIN time_entries t ON t.project_id=p.id AND t.user_id=p.user_id
+      WHERE p.user_id=$1 AND p.status='In progress' GROUP BY p.id,c.name ORDER BY p.due_date NULLS LAST`, [uid]),
+  ]);
+  const metrics = summary.rows[0];
+  const currency = 'USD';
+  const formatMoney = value => new Intl.NumberFormat('en-US', { style:'currency', currency, maximumFractionDigits:0 }).format(Number(value)||0);
+  const safeDate = new Date().toLocaleDateString('en-IN', { year:'numeric', month:'long', day:'numeric' });
+  res.setHeader('Content-Type','application/pdf');
+  res.setHeader('Content-Disposition',`attachment; filename="freelanceflow-report-${new Date().toISOString().slice(0,10)}.pdf"`);
+  const pdf = new PDFDocument({ size:'A4', margin:48, info:{ Title:'FreelanceFlow Workspace Report', Author:'FreelanceFlow' } });
+  pdf.pipe(res);
+  const left=48, right=547, width=right-left;
+  pdf.fillColor('#526c4f').font('Helvetica-Bold').fontSize(9).text('FREELANCEFLOW  /  BUSINESS REPORT',left,44);
+  pdf.fillColor('#252a24').font('Helvetica-Bold').fontSize(25).text('Workspace performance',left,72);
+  pdf.fillColor('#767d73').font('Helvetica').fontSize(9).text(`Prepared ${safeDate}`,left,108);
+  pdf.strokeColor('#dfe4dc').moveTo(left,130).lineTo(right,130).stroke();
+  const cards=[['Revenue this month',formatMoney(metrics.revenue_month)],['Outstanding',formatMoney(metrics.outstanding)],['Billable hours',`${Number(metrics.hours_month).toFixed(1)} h`]];
+  const gap=10, cardW=(width-gap*2)/3, cardY=149;
+  cards.forEach(([label,value],index)=>{
+    const x=left+index*(cardW+gap);
+    pdf.roundedRect(x,cardY,cardW,62,5).fillAndStroke('#f7f8f5','#e4e8e1');
+    pdf.fillColor('#777e74').font('Helvetica').fontSize(8).text(label.toUpperCase(),x+11,cardY+12,{width:cardW-22});
+    pdf.fillColor('#2b332a').font('Helvetica-Bold').fontSize(15).text(value,x+11,cardY+32,{width:cardW-22});
+  });
+  let y=238;
+  const sectionTitle=(title)=>{pdf.fillColor('#30382f').font('Helvetica-Bold').fontSize(13).text(title,left,y); y+=24;};
+  sectionTitle('Revenue over time');
+  const monthRows=months.rows;
+  if (!monthRows.length) { pdf.fillColor('#777e74').font('Helvetica').fontSize(9).text('No invoice revenue recorded for this period.',left,y); y+=18; }
+  monthRows.forEach(row=>{
+    if (y>735) { pdf.addPage(); y=48; }
+    const amount=Number(row.revenue)||0;
+    pdf.fillColor('#4b5149').font('Helvetica').fontSize(9).text(row.month,left,y,{width:110});
+    pdf.fillColor('#4b5149').text(formatMoney(amount),left+120,y,{width:90,align:'right'});
+    pdf.roundedRect(left+225,y+2,width-225,9,4).fill('#edf0eb');
+    if (amount>0) pdf.roundedRect(left+225,y+2,Math.max(3,(width-225)*(amount/Math.max(...monthRows.map(item=>Number(item.revenue)||0),1))),9,4).fill('#789072');
+    y+=19;
+  });
+  y+=15;
+  if (y>680) { pdf.addPage(); y=48; }
+  sectionTitle('Project budget health');
+  pdf.fillColor('#7a8178').font('Helvetica-Bold').fontSize(7.5).text('PROJECT',left,y,{width:160});
+  pdf.text('CLIENT',left+166,y,{width:115});
+  pdf.text('BUDGET',left+290,y,{width:75,align:'right'});
+  pdf.text('SPENT',left+375,y,{width:75,align:'right'});
+  pdf.text('USED',left+455,y,{width:44,align:'right'});
+  y+=15; pdf.strokeColor('#e4e8e1').moveTo(left,y).lineTo(right,y).stroke(); y+=9;
+  if (!projects.rows.length) { pdf.fillColor('#777e74').font('Helvetica').fontSize(9).text('No active projects.',left,y); y+=18; }
+  projects.rows.forEach(project=>{
+    if (y>755) { pdf.addPage(); y=48; }
+    const budget=Number(project.budget)||0, spent=Number(project.hours)*Number(project.hourly_rate), percent=budget?Math.round(spent/budget*100):0;
+    pdf.fillColor('#343a33').font('Helvetica').fontSize(8).text(project.name,left,y,{width:160,ellipsis:true});
+    pdf.fillColor('#626960').text(project.client_name,left+166,y,{width:115,ellipsis:true});
+    pdf.text(formatMoney(budget),left+290,y,{width:75,align:'right'});
+    pdf.text(formatMoney(spent),left+375,y,{width:75,align:'right'});
+    pdf.text(`${percent}%`,left+455,y,{width:44,align:'right'});
+    y+=20;
+  });
+  pdf.strokeColor('#dfe4dc').moveTo(left,780).lineTo(right,780).stroke();
+  pdf.fillColor('#8a9087').font('Helvetica').fontSize(8).text('FreelanceFlow · Workspace report · Generated from saved account data',left,791,{width});
+  pdf.end();
+}));
+
 app.post('/api/sample-data', auth, asyncRoute(async (req, res) => {
   const uid = userIdOf(req);
   const result = await transaction(async client => {
