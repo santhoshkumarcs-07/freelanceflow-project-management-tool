@@ -25,7 +25,11 @@ The included `render.yaml` defines a free Singapore web service and health check
 
 ## Razorpay invoice checkout
 
-The app uses Razorpay Standard Checkout for one-time invoice payments. Configure `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` in `server/.env` locally or in the Render service environment. Never put the key secret in a Vite variable or commit it. Use Razorpay test keys for testing and switch to live keys only after account onboarding and payment flows are approved.
+Billing has separate Demo, Test, and Live modes. Demo never contacts Razorpay. Test uses Razorpay sandbox credentials. Live checkout can create real invoice payments and a ₹499/month Pro subscription. Invoice payments are accepted only in Live mode, and an invoice is marked paid only after server-side signature and captured-payment checks.
+
+Configure `RAZORPAY_TEST_KEY_ID`, `RAZORPAY_TEST_KEY_SECRET`, `RAZORPAY_TEST_WEBHOOK_SECRET`, and optionally `RAZORPAY_PRO_PLAN_ID_TEST` for sandbox use. Configure the corresponding `RAZORPAY_LIVE_*` values for production. `PRO_MONTHLY_PRICE_INR` defaults to 499. Never expose either key secret or webhook secret to Vite or commit them. The server can create and cache the monthly plan automatically if a plan ID is omitted.
+
+In Razorpay, configure webhooks to `https://<your-domain>/api/razorpay/webhook/test` and `/api/razorpay/webhook/live` using the matching webhook secret. Subscribe to `subscription.activated`, `subscription.charged`, `subscription.pending`, `subscription.halted`, `subscription.cancelled`, `subscription.paused`, and `subscription.resumed`. Razorpay account subscription/Flash Checkout support must be enabled. Set the secrets in Render's environment settings, then deploy. Live mode stays unavailable until live keys and its webhook secret are present.
 
 When a user pays an invoice, the server creates the order from the stored invoice amount, then verifies Razorpay's HMAC signature and fetches the payment status before marking the invoice paid. Invoice amounts are stored in paise at Razorpay and the invoice currency must be enabled for the merchant account. A successful browser callback alone does not mark an invoice paid. Manual “Mark paid” is available for payments received outside the app. Pro subscription billing is not the same as one-time invoice checkout and remains separate.
 

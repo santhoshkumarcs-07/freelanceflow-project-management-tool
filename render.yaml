@@ -15,7 +15,21 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
-      - key: RAZORPAY_KEY_ID
+      - key: PRO_MONTHLY_PRICE_INR
+        value: "499"
+      - key: RAZORPAY_TEST_KEY_ID
         sync: false
-      - key: RAZORPAY_KEY_SECRET
+      - key: RAZORPAY_TEST_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_TEST_WEBHOOK_SECRET
+        sync: false
+      - key: RAZORPAY_PRO_PLAN_ID_TEST
+        sync: false
+      - key: RAZORPAY_LIVE_KEY_ID
+        sync: false
+      - key: RAZORPAY_LIVE_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_LIVE_WEBHOOK_SECRET
+        sync: false
+      - key: RAZORPAY_PRO_PLAN_ID_LIVE
         sync: false

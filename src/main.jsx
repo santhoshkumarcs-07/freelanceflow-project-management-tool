@@ -38,6 +38,7 @@ function App() {
   const [timer, setTimer] = useState(null);
   const [billingStatus, setBillingStatus] = useState(null);
   const [paymentBusy, setPaymentBusy] = useState('');
+  const [demoTourStep, setDemoTourStep] = useState(-1);
   const [now, setNow] = useState(Date.now());
   const [search, setSearch] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
@@ -100,6 +101,30 @@ function App() {
     try { setBillingStatus(await api('/billing/status')); }
     catch (error) { notify(error.message); }
   };
+  const refreshBilling = async () => {
+    const status = await api('/billing/status'); setBillingStatus(status);
+    const current = await api('/auth/me'); setUser(current.user);
+    return status;
+  };
+  const switchBillingMode = async mode => {
+    try { await api('/billing/mode', { method: 'POST', body: { mode } }); await refreshBilling(); notify(`${mode[0].toUpperCase()}${mode.slice(1)} mode selected`); }
+    catch (error) { notify(error.message); }
+  };
+  const startProCheckout = async () => {
+    setPaymentBusy('pro');
+    try {
+      if (!window.Razorpay) await new Promise((resolve,reject) => {
+        const script=document.createElement('script'); script.src='https://checkout.razorpay.com/v1/checkout.js'; script.async=true;
+        script.onload=resolve; script.onerror=()=>reject(new Error('Razorpay Checkout could not load.')); document.body.appendChild(script);
+      });
+      const sub = await api('/billing/subscription/checkout', { method:'POST', body:{} });
+      const checkout = new window.Razorpay({ key:sub.key_id, subscription_id:sub.subscription_id, name:'FreelanceFlow', description:'Pro subscription · ₹499/month', theme:{color:'#536c4f'}, modal:{ondismiss:()=>setPaymentBusy('')},
+        handler: async response => { try { await api('/billing/subscription/verify',{method:'POST',body:response}); await refreshBilling(); notify('Payment verified. Pro access updates when Razorpay activates the subscription.'); } catch(error) { notify(error.message); } finally { setPaymentBusy(''); } }
+      });
+      checkout.on('payment.failed', event=>{notify(event?.error?.description||'Subscription payment failed.');setPaymentBusy('');}); checkout.open();
+    } catch(error) { notify(error.message); setPaymentBusy(''); }
+  };
+  const cancelPro = async () => { try { await api('/billing/subscription/cancel',{method:'POST',body:{}}); await refreshBilling(); notify('Cancellation scheduled for the end of the billing period.'); } catch(error) { notify(error.message); } };
   const payInvoice = async invoice => {
     setPaymentBusy(invoice.id);
     try {
@@ -242,7 +267,7 @@ function App() {
       <div className="sidebar-bottom"><div className="plan-card"><div className="plan-top"><span className="plan-dot"></span><span>{user.plan === 'pro' ? 'Pro plan' : 'Free plan'}</span><span className="plan-limit">{user.plan === 'pro' ? 'Unlimited clients' : `${data.clients.length}/2 clients`}</span></div><div className="plan-track"><i style={{ width: user.plan === 'pro' ? '100%' : `${Math.min(100,data.clients.length*50)}%` }} /></div><button onClick={openPlanDetails}>Plan details <span>↗</span></button></div><button className="profile" onClick={signOut}><div className="avatar avatar-coral">{(user.name || 'F').slice(0,1).toUpperCase()}</div><span><b>{user.name}</b><small>Sign out</small></span><span className="chevron">↗</span></button></div>
     </aside>
     <main className="main-area">
-      <header className="topbar"><div className="breadcrumb"><span>{user.name}'s workspace</span><span className="slash">/</span><b>{page}</b></div><div className="top-actions"><div className="search-wrap"><label className="search global-search"><span>⌕</span><input ref={searchRef} placeholder="Search projects, clients, tasks…" value={search} onFocus={()=>setSearchOpen(true)} onBlur={()=>setTimeout(()=>setSearchOpen(false),120)} onChange={e => { setSearch(e.target.value); setSearchOpen(true); }} onKeyDown={e=>{if(e.key==='Enter'&&searchMatches[0])openSearchMatch(searchMatches[0]);if(e.key==='Escape')setSearchOpen(false);}}/><kbd>Ctrl K</kbd></label>{searchOpen&&search&&<div className="search-results">{searchMatches.length?searchMatches.map((match,i)=><button key={`${match.page}-${match.title}-${i}`} onMouseDown={e=>e.preventDefault()} onClick={()=>openSearchMatch(match)}><span className="result-glyph">{match.page==='Projects'?'▦':match.page==='Clients'?'◉':match.page==='Tasks'?'☷':match.page==='Invoices'?'▤':'◷'}</span><span><b>{match.title}</b><small>{match.detail}</small></span><kbd>↵</kbd></button>):<div className="search-empty">No matching records</div>}</div>}</div><button className="icon-button" title="Notifications" onClick={() => notify('You’re all caught up.')}>♧<i></i></button><div className="avatar avatar-coral top-avatar">{(user.name || 'F').slice(0,1).toUpperCase()}</div></div></header>
+      <header className="topbar"><div className="breadcrumb"><span>{user.name}'s workspace</span><span className="slash">/</span><b>{page}</b></div><div className="top-actions"><button className="mode-pill" onClick={openPlanDetails} title="Change payment mode">{(billingStatus?.mode||'demo').toUpperCase()} MODE</button><button className="text-link" onClick={()=>setDemoTourStep(0)}>Guided demo</button><div className="search-wrap"><label className="search global-search"><span>⌕</span><input ref={searchRef} placeholder="Search projects, clients, tasks…" value={search} onFocus={()=>setSearchOpen(true)} onBlur={()=>setTimeout(()=>setSearchOpen(false),120)} onChange={e => { setSearch(e.target.value); setSearchOpen(true); }} onKeyDown={e=>{if(e.key==='Enter'&&searchMatches[0])openSearchMatch(searchMatches[0]);if(e.key==='Escape')setSearchOpen(false);}}/><kbd>Ctrl K</kbd></label>{searchOpen&&search&&<div className="search-results">{searchMatches.length?searchMatches.map((match,i)=><button key={`${match.page}-${match.title}-${i}`} onMouseDown={e=>e.preventDefault()} onClick={()=>openSearchMatch(match)}><span className="result-glyph">{match.page==='Projects'?'▦':match.page==='Clients'?'◉':match.page==='Tasks'?'☷':match.page==='Invoices'?'▤':'◷'}</span><span><b>{match.title}</b><small>{match.detail}</small></span><kbd>↵</kbd></button>):<div className="search-empty">No matching records</div>}</div>}</div><button className="icon-button" title="Notifications" onClick={() => notify('You’re all caught up.')}>♧<i></i></button><div className="avatar avatar-coral top-avatar">{(user.name || 'F').slice(0,1).toUpperCase()}</div></div></header>
       <div className="page-content">
         {page === 'Overview' && <>
           <div className="welcome-row"><div><div className="eyebrow"><span className="live-dot"></span> {new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'}).toUpperCase()}</div><h1>A good week starts here<span className="period">.</span></h1><p className="subtitle">A clear view of what’s moving, what’s due, and what you’ve earned.</p></div><button className="button button-primary" onClick={() => setModal('quick')}><span>＋</span> New entry</button></div>
@@ -260,23 +285,33 @@ function App() {
         {page === 'Reports' && <><PageHeading title="Reports" subtitle="The numbers behind a sustainable independent practice." action="Export report" onAction={()=>window.print()} /><div className="time-summary"><div className="panel"><span>Revenue this month</span><b>{money(reportData?.summary.revenueMonth||0)}</b><small>Paid invoices issued this month</small></div><div className="panel"><span>Outstanding</span><b>{money(reportData?.summary.outstanding??outstanding)}</b><small>Across open invoices</small></div><div className="panel"><span>Billable hours</span><b>{Number(reportData?.summary.hoursMonth||0).toFixed(1)}h</b><small>Logged this month</small></div></div><div className="panel hours-panel report-chart"><div className="panel-header"><div><h2>Revenue over time</h2><p>Monthly paid invoices, in USD</p></div><span className="range-label">Last 6 months</span></div><div className="chart"><div className="chart-guides"><span>{money(reportMax)}</span><span>{money(reportMax*.75)}</span><span>{money(reportMax*.5)}</span><span>{money(reportMax*.25)}</span><span>$0</span></div><div className="chart-bars">{reportMonths.map((item,i)=><div className="chart-col" key={`${item.month}-${i}`}><div className="bar-zone"><i className={i===reportMonths.length-1?'today':''} style={{height:`${Math.max(item.revenue?2:0,item.revenue/reportMax*100)}%`}}/></div><span>{item.month}</span></div>)}</div></div></div><div className="panel full-table"><div className="list-title"><h2>Project budget health</h2><span>Tracked against project budgets</span></div>{(reportData?.budgets||[]).map(p=><div className="project-row report-project" key={p.id}><div className="project-cell"><i className="project-color" style={{background:p.color}}/><span><b>{p.name}</b><small>{clientName(p.clientId)}</small></span></div><div className="budget-cell"><div className="budget-text"><span>{p.budget?Math.round(p.hours*(data.clients.find(c=>c.id===p.clientId)?.rate||100)/p.budget*100):0}% used</span><small>{money(p.budget)}</small></div><div className="budget-track"><i style={{width:`${p.budget?Math.min(100,p.hours*(data.clients.find(c=>c.id===p.clientId)?.rate||100)/p.budget*100):0}%`,background:p.color}}/></div></div></div>)}</div></>}
       </div>
     </main>
-    {modal === 'plan' ? <PlanModal user={user} status={billingStatus} onClose={closeModal} /> : modal && <Modal type={modal} data={data} editing={editing} onClose={closeModal} onAdd={addRecord} onUpdate={updateRecord} onStart={startTimer} onEntry={saveTimeEntry} onInvoice={createInvoice} />}
+    {modal === 'plan' ? <PlanModal user={user} status={billingStatus} busy={paymentBusy==='pro'} onClose={closeModal} onMode={switchBillingMode} onBuy={startProCheckout} onCancel={cancelPro} /> : modal && <Modal type={modal} data={data} editing={editing} onClose={closeModal} onAdd={addRecord} onUpdate={updateRecord} onStart={startTimer} onEntry={saveTimeEntry} onInvoice={createInvoice} />}
+    {demoTourStep >= 0 && <DemoTour step={demoTourStep} hasData={data.clients.length>0} onStep={setDemoTourStep} onLoad={loadSampleData} onPage={setPage} />}
     {toast && <div className="toast"><span>✓</span>{toast}</div>}
   </div>;
 }
-function PlanModal({ user, status, onClose }) {
+function PlanModal({ user, status, busy, onClose, onMode, onBuy, onCancel }) {
   const pro = user.plan === 'pro';
   return <div className="modal-backdrop" onMouseDown={e=>e.target===e.currentTarget&&onClose()}><section className="modal plan-modal" role="dialog" aria-modal="true" aria-labelledby="plan-title">
     <div className="modal-head"><div><div className="eyebrow">WORKSPACE BILLING</div><h2 id="plan-title">Your plan</h2></div><button type="button" className="modal-close" onClick={onClose} aria-label="Close">×</button></div>
     <div className="modal-fields">
       <div className="plan-summary"><span className="plan-summary-label">CURRENT PLAN</span><strong>{pro ? 'Pro' : 'Free'}</strong><span>{pro ? 'Unlimited clients and PDF invoice downloads.' : `${status?.plan === 'free' ? 'Up to two clients.' : 'Checking your current plan…'}`}</span></div>
-      {!pro && <div className="plan-benefits"><h3>Pro includes</h3><ul><li>Unlimited clients</li><li>Downloadable PDF invoices</li><li>Invoice payments through Razorpay Checkout</li></ul></div>}
-      {!pro && <div className="billing-setup-note"><b>{status?.invoicePaymentsConfigured ? 'Razorpay invoice payments are ready.' : 'Razorpay is not configured yet.'}</b><span>Online invoice payments are available from each unpaid invoice. Pro subscription billing is separate and is not enabled by a one-time invoice payment.</span></div>}
+      <div className="plan-benefits"><h3>Pro includes</h3><ul><li>Unlimited clients</li><li>Downloadable PDF invoices</li><li>Monthly subscription management</li></ul></div>
+      <div className="billing-setup-note"><b>{status?.mode === 'demo' ? 'Demo mode never charges money.' : status?.mode === 'test' ? 'Razorpay test mode uses test payments.' : 'Live mode can create real payments.'}</b><span>Invoice payments are enabled only in Live mode. Switching to Demo disables all Razorpay invoice payments.</span></div>
+      <div className="billing-modes"><span>PAYMENT MODE</span><div>{['demo','test','live'].map(mode=><button key={mode} className={`button ${status?.mode===mode?'button-primary':'button-secondary'}`} disabled={status?.mode===mode||mode==='test'&&!status?.testAvailable||mode==='live'&&!status?.liveAvailable} onClick={()=>onMode(mode)}>{mode==='demo'?'Demo':mode==='test'?'Test':'Live'}</button>)}</div><small>{status?.mode==='demo'?'Safe workspace practice. No Razorpay checkout opens.':status?.mode==='test'?'Sandbox checkout. Transactions are simulated.':'Real Razorpay payments may charge the customer.'}</small></div>
       {!status && <p className="billing-copy">Loading plan and billing options…</p>}
-      {pro && <div className="billing-setup-note"><b>Pro plan is active.</b><span>Subscription management is not connected yet. Contact the workspace owner for plan changes.</span></div>}
+      {!pro && status?.mode==='demo' && <p className="billing-copy">To buy Pro, switch to Test for a sandbox transaction or Live for ₹499/month recurring billing.</p>}
+      {!pro && status && status.mode!=='demo' && <p className="billing-copy">Pro costs ₹{status.price?.amount ?? 499} per month. Checkout opens securely through Razorpay.</p>}
+      {pro && <div className="billing-setup-note"><b>Pro subscription {status?.subscriptionStatus || 'active'}{status?.subscriptionMode ? ` · ${status.subscriptionMode}` : ''}.</b><span>{status?.cancelAtCycleEnd ? 'Cancellation is scheduled at the end of this billing period.' : 'Your Pro features are active. Cancellation takes effect at the end of the current billing period.'}</span></div>}
     </div>
-    <div className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Close</button></div>
+    <div className="modal-actions">{pro&&!status?.cancelAtCycleEnd&&<button className="button button-secondary" type="button" onClick={onCancel}>Cancel at period end</button>}{!pro&&status?.mode!=='demo'&&<button className="button button-primary" type="button" disabled={busy||!status?.[`${status.mode}Available`]} onClick={onBuy}>{busy?'Opening checkout…':`Continue to Pro · ₹${status?.price?.amount ?? 499}/mo`}</button>}<button className="button button-secondary" type="button" onClick={onClose}>Close</button></div>
   </section></div>;
+}
+function DemoTour({step,hasData,onStep,onLoad,onPage}) {
+  const pages=['Overview','Clients','Projects','Time','Invoices','Reports'];
+  const page=pages[Math.min(step,pages.length-1)];
+  useEffect(()=>{if(step>=0&&step<pages.length)onPage(page);},[step]);
+  return <div className="tour-backdrop"><section className="tour-card" role="dialog" aria-modal="true" aria-label="Guided demo"><div className="eyebrow">GUIDED DEMO · {Math.min(step+1,pages.length)} OF {pages.length}</div><h2>{page}</h2><p>{['Your overview brings project activity, time, and invoices together.','Search or add clients, and keep their contact details in one place.','Track project status, deadlines, and budget use.','Start a persistent timer or enter hours manually.','Create invoices from unbilled time. Demo mode never opens payment checkout.','Review revenue and project budget reports.'][Math.min(step,pages.length-1)]}</p>{!hasData&&<div className="billing-setup-note"><b>Try the workspace with sample records.</b><span>Sample records are saved to your account and can be edited or deleted.</span><button className="button button-secondary" onClick={onLoad}>Load sample data</button></div>}<div className="tour-actions"><button className="button button-secondary" onClick={()=>onStep(-1)}>Exit</button><button className="button button-secondary" disabled={step===0} onClick={()=>onStep(step-1)}>Back</button><button className="button button-primary" onClick={()=>step===pages.length-1?onStep(-1):onStep(step+1)}>{step===pages.length-1?'Finish':'Continue'}</button></div></section></div>;
 }
 function formatElapsed(ms) { const total=Math.floor(ms/1000), h=String(Math.floor(total/3600)).padStart(2,'0'), m=String(Math.floor(total%3600/60)).padStart(2,'0'), s=String(total%60).padStart(2,'0'); return `${h}:${m}:${s}`; }
 function PageHeading({title,subtitle,action,onAction}) { return <div className="welcome-row page-heading"><div><div className="eyebrow">STUDIO SANTh <span className="slash">/</span> WORKSPACE</div><h1>{title}<span className="period">.</span></h1><p className="subtitle">{subtitle}</p></div>{action&&<button className="button button-primary" onClick={onAction}>{action}</button>}</div>; }

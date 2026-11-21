@@ -10,6 +10,31 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_mode TEXT NOT NULL DEFAULT 'demo';
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_billing_mode_check') THEN
+    ALTER TABLE users ADD CONSTRAINT users_billing_mode_check CHECK (billing_mode IN ('demo', 'test', 'live'));
+  END IF;
+END $$;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS razorpay_subscription_id TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS razorpay_subscription_status TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS razorpay_subscription_mode TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS razorpay_event_created BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS razorpay_cancel_at_cycle_end BOOLEAN NOT NULL DEFAULT false;
+CREATE UNIQUE INDEX IF NOT EXISTS users_razorpay_subscription_idx ON users(razorpay_subscription_id) WHERE razorpay_subscription_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS razorpay_plans (
+  mode TEXT PRIMARY KEY CHECK (mode IN ('test', 'live')),
+  plan_id TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS razorpay_webhook_events (
+  mode TEXT NOT NULL CHECK (mode IN ('test', 'live')),
+  event_id TEXT NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (mode, event_id)
+);
+
 -- Razorpay Standard Checkout records its order on the invoice and only marks
 -- the invoice paid after a verified signature and captured payment lookup.
 
@@ -63,6 +88,7 @@ CREATE TABLE IF NOT EXISTS invoices (
   FOREIGN KEY (user_id, client_id) REFERENCES clients(user_id, id) ON DELETE RESTRICT
 );
 ALTER TABLE invoices ADD COLUMN IF NOT EXISTS razorpay_order_id TEXT;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS razorpay_order_mode TEXT;
 ALTER TABLE invoices ADD COLUMN IF NOT EXISTS razorpay_payment_id TEXT;
 CREATE INDEX IF NOT EXISTS invoices_user_status_idx ON invoices(user_id, status, due_at);
 CREATE UNIQUE INDEX IF NOT EXISTS invoices_razorpay_order_idx ON invoices(razorpay_order_id) WHERE razorpay_order_id IS NOT NULL;

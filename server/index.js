@@ -22,9 +22,28 @@ const app = express();
 const port = Number(process.env.PORT || 3001);
 const jwtSecret = process.env.JWT_SECRET;
 if (!jwtSecret || jwtSecret.length < 32) throw new Error('JWT_SECRET must be configured with at least 32 characters.');
-const razorpayKeyId = process.env.RAZORPAY_KEY_ID;
-const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET;
-const razorpay = razorpayKeyId && razorpayKeySecret ? new Razorpay({ key_id: razorpayKeyId, key_secret: razorpayKeySecret }) : null;
+const legacyKeyId = process.env.RAZORPAY_KEY_ID || '';
+const legacyKeySecret = process.env.RAZORPAY_KEY_SECRET || '';
+const razorpayConfig = {
+  test: {
+    keyId: process.env.RAZORPAY_TEST_KEY_ID || (legacyKeyId.startsWith('rzp_test_') ? legacyKeyId : ''),
+    keySecret: process.env.RAZORPAY_TEST_KEY_SECRET || (legacyKeyId.startsWith('rzp_test_') ? legacyKeySecret : ''),
+    webhookSecret: process.env.RAZORPAY_TEST_WEBHOOK_SECRET || '',
+    planId: process.env.RAZORPAY_PRO_PLAN_ID_TEST || '',
+  },
+  live: {
+    keyId: process.env.RAZORPAY_LIVE_KEY_ID || (legacyKeyId.startsWith('rzp_live_') ? legacyKeyId : ''),
+    keySecret: process.env.RAZORPAY_LIVE_KEY_SECRET || (legacyKeyId.startsWith('rzp_live_') ? legacyKeySecret : ''),
+    webhookSecret: process.env.RAZORPAY_LIVE_WEBHOOK_SECRET || '',
+    planId: process.env.RAZORPAY_PRO_PLAN_ID_LIVE || '',
+  },
+};
+const proMonthlyPrice = Number(process.env.PRO_MONTHLY_PRICE_INR || 499);
+if (!Number.isFinite(proMonthlyPrice) || proMonthlyPrice < 1 || proMonthlyPrice > 100000) throw new Error('PRO_MONTHLY_PRICE_INR must be between 1 and 100000.');
+const razorpayFor = mode => {
+  const config = razorpayConfig[mode];
+  return config?.keyId && config?.keySecret ? new Razorpay({ key_id: config.keyId, key_secret: config.keySecret }) : null;
+};
 
 app.disable('x-powered-by');
 if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
@@ -41,6 +60,13 @@ app.use(helmet({
 }));
 app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:5173', credentials: true }));
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+for (const mode of ['test', 'live']) {
+  app.post(`/api/razorpay/webhook/${mode}`, express.raw({ type: 'application/json' }), asyncRoute(async (req, res) => {
+    await processRazorpayWebhook(mode, req.body, req.get('x-razorpay-signature'), req.get('x-razorpay-event-id'));
+    res.json({ received: true });
+  }));
+}
 
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
@@ -86,6 +112,38 @@ function requireAuth(req, res, next) {
 }
 const auth = [requireAuth];
 
+function validHmacHex(key, message, signature) {
+  if (!signature || !/^[a-f0-9]{64}$/i.test(signature)) return false;
+  const expected = createHmac('sha256', key).update(message).digest();
+  const received = Buffer.from(signature, 'hex');
+  return expected.length === received.length && timingSafeEqual(expected, received);
+}
+
+async function processRazorpayWebhook(mode, rawBody, signature, eventId) {
+  const config = razorpayConfig[mode];
+  if (!config?.webhookSecret) throw new HttpError(503, 'Razorpay webhook is not configured for this mode.');
+  if (!Buffer.isBuffer(rawBody) || !validHmacHex(config.webhookSecret, rawBody, signature)) {
+    throw new HttpError(400, 'Invalid Razorpay webhook signature.');
+  }
+  if (!eventId || eventId.length > 200) throw new HttpError(400, 'Razorpay event ID is missing.');
+  let event;
+  try { event = JSON.parse(rawBody.toString('utf8')); }
+  catch { throw new HttpError(400, 'Invalid Razorpay webhook payload.'); }
+  const subscription = event.payload?.subscription?.entity;
+  await transaction(async client => {
+    const inserted = await client.query('INSERT INTO razorpay_webhook_events(mode,event_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING event_id', [mode,eventId]);
+    if (!inserted.rowCount || !subscription) return;
+    const createdAt = Number(event.created_at || Math.floor(Date.now() / 1000));
+    const status = subscription.status || 'unknown';
+    const revoke = ['halted','cancelled','paused','completed','expired'].includes(status);
+    await client.query(`UPDATE users SET razorpay_subscription_status=$1,
+      plan=CASE WHEN $2 THEN 'pro' WHEN $3 THEN 'free' ELSE plan END,
+      razorpay_event_created=$4,razorpay_cancel_at_cycle_end=CASE WHEN $3 THEN false ELSE razorpay_cancel_at_cycle_end END
+      WHERE razorpay_subscription_mode=$5 AND razorpay_event_created <= $4 AND razorpay_subscription_id=$6`,
+      [status,status === 'active',revoke,createdAt,mode,subscription.id]);
+  });
+}
+
 app.get('/api/health', asyncRoute(async (_req, res) => {
   await pool.query('SELECT 1');
   res.json({ ok: true, service: 'freelanceflow-api' });
@@ -127,16 +185,135 @@ app.get('/api/auth/me', auth, asyncRoute(async (req, res) => {
   res.json({ user: result.rows[0] });
 }));
 
+async function proPlanFor(mode, client) {
+  const config = razorpayConfig[mode];
+  if (config.planId) return config.planId;
+  const stored = await client.query('SELECT plan_id FROM razorpay_plans WHERE mode=$1', [mode]);
+  if (stored.rowCount) return stored.rows[0].plan_id;
+  const gateway = razorpayFor(mode);
+  if (!gateway) throw new HttpError(503, `Razorpay ${mode} keys are not configured.`);
+  let created;
+  try {
+    created = await gateway.plans.create({
+      period: 'monthly', interval: 1,
+      item: { name: 'FreelanceFlow Pro', amount: Math.round(proMonthlyPrice * 100), currency: 'INR', description: 'FreelanceFlow Pro monthly subscription' },
+    });
+  } catch (error) {
+    console.error('Razorpay plan creation failed:', error?.statusCode || error?.error?.code || 'provider error');
+    throw new HttpError(502, 'Razorpay could not prepare the Pro plan. Check that subscriptions are enabled on this account.');
+  }
+  const saved = await client.query(`INSERT INTO razorpay_plans(mode,plan_id) VALUES($1,$2)
+    ON CONFLICT(mode) DO UPDATE SET plan_id=razorpay_plans.plan_id RETURNING plan_id`, [mode,created.id]);
+  return saved.rows[0].plan_id;
+}
+
 app.get('/api/billing/status', auth, asyncRoute(async (req, res) => {
-  const result = await pool.query('SELECT plan FROM users WHERE id=$1', [userIdOf(req)]);
+  const result = await pool.query(`SELECT plan,billing_mode,razorpay_subscription_id,razorpay_subscription_status,
+    razorpay_subscription_mode,razorpay_cancel_at_cycle_end FROM users WHERE id=$1`, [userIdOf(req)]);
   if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
   const account = result.rows[0];
+  const configured = mode => Boolean(razorpayFor(mode) && razorpayConfig[mode].webhookSecret);
   res.json({
     plan: account.plan,
-    checkoutConfigured: Boolean(razorpay),
-    invoicePaymentsConfigured: Boolean(razorpay),
-    keyId: razorpay ? razorpayKeyId : null,
+    mode: account.billing_mode,
+    testAvailable: configured('test'),
+    liveAvailable: configured('live'),
+    invoicePaymentsConfigured: account.billing_mode === 'live' && Boolean(razorpayFor('live')),
+    subscriptionStatus: account.razorpay_subscription_status,
+    subscriptionMode: account.razorpay_subscription_mode,
+    cancelAtCycleEnd: account.razorpay_cancel_at_cycle_end,
+    price: { amount: proMonthlyPrice, currency: 'INR', interval: 'month' },
   });
+}));
+
+app.post('/api/billing/mode', auth, asyncRoute(async (req, res) => {
+  const { mode } = body(z.object({ mode: z.enum(['demo','test','live']) }), req.body);
+  const result = await pool.query(`SELECT plan,razorpay_subscription_status,razorpay_subscription_id FROM users WHERE id=$1`, [userIdOf(req)]);
+  if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
+  const account = result.rows[0];
+  if (account.razorpay_subscription_id && !['cancelled','completed','expired'].includes(account.razorpay_subscription_status)) {
+    throw new HttpError(409, 'Cancel or finish the current subscription before changing payment mode.');
+  }
+  if (mode !== 'demo' && (!razorpayFor(mode) || !razorpayConfig[mode].webhookSecret)) {
+    throw new HttpError(503, `Razorpay ${mode} mode is not fully configured yet.`);
+  }
+  await pool.query('UPDATE users SET billing_mode=$1,plan=\'free\' WHERE id=$2', [mode,userIdOf(req)]);
+  res.json({ mode });
+}));
+
+app.post('/api/billing/subscription/checkout', auth, asyncRoute(async (req, res) => {
+  const result = await pool.query(`SELECT id,plan,billing_mode,razorpay_subscription_status,razorpay_subscription_id
+    FROM users WHERE id=$1`, [userIdOf(req)]);
+  if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
+  const account = result.rows[0];
+  const mode = account.billing_mode;
+  if (mode === 'demo') throw new HttpError(409, 'Demo mode never starts a payment. Switch to Test or Live mode to continue.');
+  const gateway = razorpayFor(mode);
+  if (!gateway || !razorpayConfig[mode].webhookSecret) throw new HttpError(503, `Razorpay ${mode} checkout is not fully configured.`);
+  if (account.plan === 'pro' && account.razorpay_subscription_status === 'active') throw new HttpError(409, 'Pro is already active for this workspace.');
+  if (account.razorpay_subscription_id && !['cancelled','completed','expired'].includes(account.razorpay_subscription_status)) {
+    throw new HttpError(409, 'A subscription is already in progress for this workspace.');
+  }
+  try {
+    const planId = await proPlanFor(mode, pool);
+    const subscription = await gateway.subscriptions.create({
+      plan_id: planId, total_count: 120, quantity: 1, customer_notify: false,
+      notes: { user_id: account.id, product: 'freelanceflow-pro', mode },
+    });
+    await pool.query(`UPDATE users SET razorpay_subscription_id=$1,razorpay_subscription_status=$2,
+      razorpay_subscription_mode=$3,razorpay_event_created=0,razorpay_cancel_at_cycle_end=false
+      WHERE id=$4 AND billing_mode=$3`, [subscription.id,subscription.status || 'created',mode,account.id]);
+    res.status(201).json({ subscription_id: subscription.id, key_id: razorpayConfig[mode].keyId, mode, status: subscription.status || 'created' });
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    console.error('Razorpay subscription creation failed:', error?.statusCode || error?.error?.code || 'provider error');
+    throw new HttpError(502, 'Razorpay could not start the subscription. Check that the selected mode and plan are enabled.');
+  }
+}));
+
+const subscriptionCallbackSchema = z.object({
+  razorpay_payment_id: z.string().min(1).max(100),
+  razorpay_subscription_id: z.string().min(1).max(100),
+  razorpay_signature: z.string().regex(/^[a-f0-9]{64}$/i),
+});
+app.post('/api/billing/subscription/verify', auth, asyncRoute(async (req, res) => {
+  const input = body(subscriptionCallbackSchema, req.body);
+  const result = await pool.query(`SELECT id,billing_mode,plan,razorpay_subscription_id,razorpay_subscription_mode
+    FROM users WHERE id=$1`, [userIdOf(req)]);
+  if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
+  const account = result.rows[0];
+  const mode = account.razorpay_subscription_mode;
+  if (!mode || account.razorpay_subscription_id !== input.razorpay_subscription_id) throw new HttpError(400, 'Subscription does not match this workspace.');
+  const gateway = razorpayFor(mode);
+  if (!gateway || !validHmacHex(razorpayConfig[mode].keySecret, `${input.razorpay_payment_id}|${account.razorpay_subscription_id}`, input.razorpay_signature)) {
+    throw new HttpError(400, 'Subscription payment signature is invalid.');
+  }
+  let subscription;
+  try { subscription = await gateway.subscriptions.fetch(account.razorpay_subscription_id); }
+  catch { throw new HttpError(502, 'Could not confirm subscription status with Razorpay.'); }
+  const active = subscription.status === 'active';
+  await pool.query(`UPDATE users SET razorpay_subscription_status=$1,plan=CASE WHEN $2 THEN 'pro' ELSE plan END
+    WHERE id=$3 AND razorpay_subscription_id=$4 AND razorpay_subscription_mode=$5`,
+    [subscription.status,active,account.id,subscription.id,mode]);
+  res.json({ verified: true, status: subscription.status, plan: active ? 'pro' : account.plan });
+}));
+
+app.post('/api/billing/subscription/cancel', auth, asyncRoute(async (req, res) => {
+  const result = await pool.query(`SELECT billing_mode,razorpay_subscription_id,razorpay_subscription_status
+    FROM users WHERE id=$1`, [userIdOf(req)]);
+  if (!result.rowCount) throw new HttpError(401, 'Your account is no longer available.');
+  const account = result.rows[0];
+  if (!account.razorpay_subscription_id || account.razorpay_subscription_status !== 'active') throw new HttpError(409, 'There is no active subscription to cancel.');
+  const gateway = razorpayFor(account.billing_mode);
+  if (!gateway) throw new HttpError(503, 'Razorpay is not configured for this subscription.');
+  try {
+    await gateway.subscriptions.cancel(account.razorpay_subscription_id, { cancel_at_cycle_end: true });
+    await pool.query('UPDATE users SET razorpay_cancel_at_cycle_end=true WHERE id=$1', [userIdOf(req)]);
+    res.json({ cancellationScheduled: true });
+  } catch (error) {
+    console.error('Razorpay cancellation failed:', error?.statusCode || error?.error?.code || 'provider error');
+    throw new HttpError(502, 'Razorpay could not schedule the cancellation. Try again later.');
+  }
 }));
 
 const paymentCallbackSchema = z.object({
@@ -145,7 +322,11 @@ const paymentCallbackSchema = z.object({
   razorpay_signature: z.string().regex(/^[a-f0-9]{64}$/i),
 });
 app.post('/api/invoices/:id/create-order', auth, asyncRoute(async (req, res) => {
-  if (!razorpay) throw new HttpError(503, 'Razorpay checkout is not configured on the server.');
+  const account = await pool.query('SELECT billing_mode FROM users WHERE id=$1', [userIdOf(req)]);
+  if (account.rows[0]?.billing_mode !== 'live') throw new HttpError(409, 'Invoice payments are available only in Live mode. Demo and Test modes cannot charge clients.');
+  const razorpay = razorpayFor('live');
+  const razorpayKeyId = razorpayConfig.live.keyId;
+  if (!razorpay) throw new HttpError(503, 'Razorpay Live checkout is not configured on the server.');
   const id = idParam(req.params.id);
   const result = await pool.query('SELECT id,number,amount,currency,status FROM invoices WHERE id=$1 AND user_id=$2', [id,userIdOf(req)]);
   if (!result.rowCount) throw new HttpError(404, 'Invoice not found.');
@@ -160,7 +341,7 @@ app.post('/api/invoices/:id/create-order', auth, asyncRoute(async (req, res) => 
       amount, currency, receipt: invoice.number,
       notes: { invoice_id: invoice.id, user_id: userIdOf(req) },
     });
-    const linked = await pool.query(`UPDATE invoices SET razorpay_order_id=$1
+    const linked = await pool.query(`UPDATE invoices SET razorpay_order_id=$1,razorpay_order_mode='live'
       WHERE id=$2 AND user_id=$3 AND status<>'Paid' RETURNING id`, [order.id,id,userIdOf(req)]);
     if (!linked.rowCount) throw new HttpError(409, 'This invoice was already paid. Reload the invoice list.');
     res.status(201).json({ order_id: order.id, amount: order.amount, currency: order.currency, key_id: razorpayKeyId });
@@ -172,13 +353,15 @@ app.post('/api/invoices/:id/create-order', auth, asyncRoute(async (req, res) => 
 }));
 
 app.post('/api/invoices/:id/verify-payment', auth, asyncRoute(async (req, res) => {
-  if (!razorpay) throw new HttpError(503, 'Razorpay checkout is not configured on the server.');
+  const razorpay = razorpayFor('live');
+  const razorpayKeySecret = razorpayConfig.live.keySecret;
+  if (!razorpay) throw new HttpError(503, 'Razorpay Live checkout is not configured on the server.');
   const id = idParam(req.params.id);
   const input = body(paymentCallbackSchema, req.body);
-  const invoiceResult = await pool.query('SELECT id,amount,currency,status,razorpay_order_id,razorpay_payment_id FROM invoices WHERE id=$1 AND user_id=$2', [id,userIdOf(req)]);
+  const invoiceResult = await pool.query('SELECT id,amount,currency,status,razorpay_order_id,razorpay_payment_id,razorpay_order_mode FROM invoices WHERE id=$1 AND user_id=$2', [id,userIdOf(req)]);
   if (!invoiceResult.rowCount) throw new HttpError(404, 'Invoice not found.');
   const invoice = invoiceResult.rows[0];
-  if (invoice.razorpay_order_id !== input.razorpay_order_id) throw new HttpError(400, 'Payment order does not match this invoice.');
+  if (invoice.razorpay_order_id !== input.razorpay_order_id || invoice.razorpay_order_mode !== 'live') throw new HttpError(400, 'Payment order does not match this invoice.');
   const expected = createHmac('sha256', razorpayKeySecret).update(`${input.razorpay_order_id}|${input.razorpay_payment_id}`).digest();
   const supplied = Buffer.from(input.razorpay_signature, 'hex');
   if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) throw new HttpError(400, 'Payment signature is invalid.');
