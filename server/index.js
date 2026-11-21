@@ -410,10 +410,10 @@ app.post('/api/clients', auth, asyncRoute(async (req, res) => {
   const input = body(z.object(clientFields), req.body);
   const uid = userIdOf(req);
   const result = await transaction(async client => {
-    const account = await client.query('SELECT plan FROM users WHERE id=$1 FOR UPDATE', [uid]);
+    const account = await client.query('SELECT plan,billing_mode FROM users WHERE id=$1 FOR UPDATE', [uid]);
     if (!account.rowCount) throw new HttpError(401, 'Account not found.');
     const count = await client.query('SELECT count(*)::int AS count FROM clients WHERE user_id=$1', [uid]);
-    if (account.rows[0].plan === 'free' && count.rows[0].count >= 2) throw new HttpError(403, 'The Free plan includes up to two clients.');
+    if (account.rows[0].plan === 'free' && account.rows[0].billing_mode !== 'demo' && count.rows[0].count >= 2) throw new HttpError(403, 'The Free plan includes up to two clients. Switch to Demo mode to try unlimited Pro features.');
     return client.query(`INSERT INTO clients(user_id,name,contact,email,hourly_rate) VALUES($1,$2,$3,$4,$5) RETURNING id,name,contact,email,hourly_rate,color`, [uid,input.name,input.contact,input.email,input.hourlyRate]);
   });
   res.status(201).json(clientDto(result.rows[0]));
@@ -581,9 +581,9 @@ app.post('/api/invoices', auth, asyncRoute(async (req, res) => {
   res.status(201).json(invoice);
 }));
 app.get('/api/invoices/:id/pdf', auth, asyncRoute(async (req, res) => {
-  const account = await pool.query('SELECT plan FROM users WHERE id=$1', [userIdOf(req)]);
+  const account = await pool.query('SELECT plan,billing_mode FROM users WHERE id=$1', [userIdOf(req)]);
   if (!account.rowCount) throw new HttpError(401, 'Your account is no longer available.');
-  if (account.rows[0].plan !== 'pro') throw new HttpError(403, 'PDF downloads are included with the Pro plan.');
+  if (account.rows[0].plan !== 'pro' && account.rows[0].billing_mode !== 'demo') throw new HttpError(403, 'PDF downloads are included with the Pro plan. Switch to Demo mode to preview Pro features.');
   const result = await pool.query(`SELECT i.id,i.number,i.amount,i.currency,i.issued_at,i.due_at,i.status,c.name AS client_name
     FROM invoices i JOIN clients c ON c.user_id=i.user_id AND c.id=i.client_id WHERE i.user_id=$1 AND i.id=$2`, [userIdOf(req),idParam(req.params.id)]);
   if (!result.rowCount) throw new HttpError(404, 'Invoice not found.');

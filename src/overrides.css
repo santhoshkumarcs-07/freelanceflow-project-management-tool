@@ -95,3 +95,27 @@
 .tour-card .billing-setup-note { margin:16px 0; display:grid; gap:8px; }
 .tour-actions { margin-top:22px; display:flex; justify-content:flex-end; gap:8px; }
 @media(max-width:760px) { .top-actions { gap:8px; } .mode-pill { padding:8px; font-size:9px; } }
+
+/* Report print layout: export only the report content, never the application chrome. */
+.report-print-header { display: none; }
+@page { size: A4; margin: 16mm; }
+@media print {
+  html, body, #root, .app-shell, .main-area, .page-content { width: auto !important; height: auto !important; min-height: 0 !important; overflow: visible !important; background: #fff !important; }
+  body * { visibility: hidden !important; }
+  .report-export, .report-export * { visibility: visible !important; }
+  .report-export { position: absolute !important; inset: 0 auto auto 0 !important; width: 100% !important; max-width: none !important; padding: 0 !important; margin: 0 !important; color: #252a24 !important; background: #fff !important; }
+  .report-print-header { display: flex !important; justify-content: space-between; align-items: flex-start; gap: 24px; margin: 0 0 22px; padding: 0 0 16px; border-bottom: 2px solid #536c4f; }
+  .report-print-header .eyebrow { margin: 0 0 8px; color: #536c4f !important; font-size: 9pt !important; letter-spacing: .12em; }
+  .report-print-header h1 { margin: 0; color: #252a24 !important; font: 700 23pt/1.15 Georgia, serif; }
+  .report-print-header p { margin: 8px 0 0; color: #666 !important; font-size: 9pt; }
+  .report-print-header > span { color: #777; font-size: 8pt; letter-spacing: .12em; }
+  .report-export .page-heading { margin: 0 0 16px !important; }
+  .report-export .page-heading .button, .report-export .demo-note, .sidebar, .topbar, .toast { display: none !important; }
+  .report-export .time-summary { display: grid !important; grid-template-columns: repeat(3, 1fr) !important; gap: 10px !important; margin-bottom: 14px !important; }
+  .report-export .panel { border: 1px solid #dfe3dc !important; border-radius: 5px !important; box-shadow: none !important; break-inside: avoid; }
+  .report-export .hours-panel, .report-export .full-table { margin-top: 12px !important; }
+  .report-export .chart { min-height: 210px; }
+  .report-export .full-table { break-inside: auto; }
+  .report-export .report-project { break-inside: avoid; }
+  .report-export h1, .report-export h2, .report-export p, .report-export span, .report-export b, .report-export small { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+}
